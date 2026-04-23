@@ -11,7 +11,9 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.routing import Mount
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 from surfsense_mcp.server import get_header_mcp, get_stdio_mcp
 
@@ -58,6 +60,33 @@ class ServerMode(Enum):
     HTTP = "http"
 
 
+async def healthz(_request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
+
+
+def resolve_cors_origins() -> list[str]:
+    """Parse MCP_ALLOWED_ORIGINS; fall back to ['*'] outside production."""
+    raw = os.getenv("MCP_ALLOWED_ORIGINS", "").strip()
+    env = os.getenv("MCP_ENV", "development").strip().lower()
+
+    if raw:
+        origins = [o.strip() for o in raw.split(",") if o.strip()]
+        if origins:
+            if env == "production" and "*" in origins:
+                logger.warning(
+                    "MCP_ALLOWED_ORIGINS contains '*' in production — "
+                    "tighten to explicit origins before public exposure"
+                )
+            return origins
+
+    if env == "production":
+        logger.warning(
+            "MCP_ALLOWED_ORIGINS is unset in production — defaulting to '*'. "
+            "Set MCP_ALLOWED_ORIGINS to restrict CORS."
+        )
+    return ["*"]
+
+
 def main() -> None:
     """Run the MCP server."""
     server_mode = ServerMode.STDIO
@@ -83,7 +112,7 @@ def main() -> None:
         cors = [
             Middleware(
                 CORSMiddleware,
-                allow_origins=["*"],
+                allow_origins=resolve_cors_origins(),
                 allow_credentials=False,
                 allow_methods=["*"],
                 allow_headers=[
@@ -98,7 +127,10 @@ def main() -> None:
         header_app = header_mcp.http_app(middleware=cors, stateless_http=True)
 
         app = Starlette(
-            routes=[Mount("/", app=header_app)],
+            routes=[
+                Route("/healthz", healthz, methods=["GET"]),
+                Mount("/", app=header_app),
+            ],
             lifespan=header_app.lifespan,
         )
 

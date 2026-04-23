@@ -128,6 +128,59 @@ Replace `/absolute/path/to/surfsense-mcp-server/.venv/bin/python` with the real 
 |---|---|---|
 | `SURFSENSE_BASE_URL` | yes (all modes) | Base URL of the SurfSense backend — no trailing slash (e.g. `http://localhost:8000`). |
 | `SURFSENSE_JWT` | yes (stdio only) | JWT forwarded as `Authorization: Bearer`. In HTTP mode the token is taken from the request header. |
+| `MCP_ENV` | no | `production` | `development` (default). Controls warning-level CORS behaviour. |
+| `MCP_ALLOWED_ORIGINS` | no | Comma-separated CORS origins for HTTP mode. If unset in production, falls back to `*` with a warning. |
+
+## Production deployment (foss-server-bundle-devstack)
+
+When deployed as part of the Moneta `foss-server-bundle-devstack` the MCP server runs as a sidecar container on its own subdomain:
+
+```
+https://<prefix>research-mcp.<platform-domain>/mcp
+```
+
+End users still authenticate with a **SurfSense JWT** — the MCP endpoint is intentionally *not* wrapped in `mpass-auth` because MCP clients (Claude Desktop, Cursor, mcp-remote) cannot follow interactive OIDC redirects mid-stream. The server's `SurfSenseHeaderAuthProvider` validates every request by calling `GET /users/me` on the internal `surfsense-backend:8000`.
+
+### Minting a JWT via mPass
+
+After a browser login to the SurfSense app (which goes through oauth2-proxy → Cognito), the SurfSense fork exposes a bridge route that exchanges the mPass-authenticated session for a long-lived SurfSense JWT:
+
+```bash
+# The _oauth2_proxy cookie set on .<platform-domain> is sent automatically by
+# the browser. The fork's /auth/jwt/proxy-login route reads X-Auth-Request-Email
+# (injected by Traefik after ForwardAuth) and returns a SurfSense JWT.
+curl -s https://<prefix>research.<platform-domain>/auth/jwt/proxy-login \
+     -b "_oauth2_proxy=$COOKIE" \
+     | jq -r '.access_token'
+```
+
+In practice, easiest is Option A from [Get a JWT](#get-a-jwt) — copy the bearer token from `localStorage` after signing in.
+
+### MCP client config (Claude Desktop / Cursor via mcp-remote)
+
+```json
+{
+  "mcpServers": {
+    "surfsense": {
+      "command": "npx",
+      "args": [
+        "mcp-remote@latest",
+        "https://<prefix>research-mcp.<platform-domain>/mcp"
+      ],
+      "headers": {
+        "Authorization": "Bearer <paste-surfsense-jwt-here>"
+      }
+    }
+  }
+}
+```
+
+The JWT is short-lived (default ~1 day). When calls start returning `401`, re-mint and update the config. There is no automatic refresh in HTTP mode — that is the tradeoff for staying out of the browser-redirect flow. A future MCP OAuth 2.1 bridge can eliminate the paste step (see `plans/mcp-oauth-bridge.md` for the design).
+
+### Healthcheck
+
+- Container-level: `GET /healthz` returns `{"status":"ok"}` unauthenticated. Docker and Traefik uptime probes use this route rather than `/mcp` so they never need to forge bearer headers.
+- Upstream dependency health (SurfSense backend reachable, JWT validation working) is surfaced only by real tool calls — `/healthz` is deliberately process-liveness only.
 
 ## Development
 
