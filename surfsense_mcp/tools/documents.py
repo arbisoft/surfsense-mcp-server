@@ -10,6 +10,10 @@ from fastmcp import FastMCP
 
 from surfsense_mcp.client import authed_multipart_post, authed_request
 
+# Mirrors MAX_FILE_SIZE_BYTES in surfsense_backend/app/routes/documents_routes.py.
+# Duplicated rather than imported because the backend is a separate package.
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+
 
 def register_document_tools(mcp: FastMCP) -> None:
     """Register document tools."""
@@ -147,27 +151,22 @@ def register_document_tools(mcp: FastMCP) -> None:
         file_path: str,
         search_space_id: int,
         should_summarize: bool = True,
-        use_vision_llm: bool = False,
-        processing_mode: str = "basic",
     ) -> dict[str, Any]:
         """
         Upload a local file to a search space for indexing.
 
-        Reads the file at `file_path` from disk (so the MCP server must have
-        filesystem access to it), sends it as multipart form data to
-        SurfSense's ingestion endpoint, and returns the backend response
-        (queued document IDs plus processing status).
+        Prefer this over `upload_document_content` whenever the MCP server has
+        filesystem access to the file (stdio mode on the user's machine, or a
+        shared mount). The bytes go straight to disk → multipart upload, with
+        no base64 inflation across the MCP transport.
 
         Args:
             file_path: Absolute path to a local file (PDF, DOCX, XLSX, CSV,
-                TXT, MD, ...).
+                TXT, MD, ...). Must be readable by the MCP server process and
+                no larger than 500 MB.
             search_space_id: Space that will own the new document(s).
             should_summarize: If true, the backend generates an LLM summary
                 once processing completes.
-            use_vision_llm: If true and the file is image-bearing, use a
-                vision model to extract content.
-            processing_mode: One of "basic", "advanced" (coerced by the
-                backend's ProcessingMode enum).
 
         Returns:
             The raw JSON response from `/api/v1/documents/fileupload`,
@@ -176,6 +175,13 @@ def register_document_tools(mcp: FastMCP) -> None:
         path = Path(file_path).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f"File not found or not a regular file: {file_path}")
+
+        size = path.stat().st_size
+        if size > MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"File '{path.name}' is {size / (1024 * 1024):.1f} MB, "
+                f"exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB per-file limit."
+            )
 
         mime_type, _ = mimetypes.guess_type(str(path))
         mime_type = mime_type or "application/octet-stream"
@@ -188,8 +194,6 @@ def register_document_tools(mcp: FastMCP) -> None:
             data={
                 "search_space_id": str(search_space_id),
                 "should_summarize": str(should_summarize).lower(),
-                "use_vision_llm": str(use_vision_llm).lower(),
-                "processing_mode": processing_mode,
             },
             timeout=300.0,
         )
@@ -202,16 +206,16 @@ def register_document_tools(mcp: FastMCP) -> None:
         search_space_id: int,
         mime_type: str | None = None,
         should_summarize: bool = True,
-        use_vision_llm: bool = False,
-        processing_mode: str = "basic",
     ) -> dict[str, Any]:
         """
         Upload a file to a search space by passing its bytes inline (base64).
 
-        Use this when the caller (e.g. the Claude desktop/web app) cannot share
-        a filesystem path with the MCP server — attach the file to the chat,
-        base64-encode its raw bytes, and pass them here. For local files the
-        MCP server can already read, prefer `upload_document` instead.
+        Use this when the caller cannot share a filesystem path with the MCP
+        server — e.g. a Claude Desktop chat attachment, or a hosted HTTP-mode
+        MCP. MCP is JSON-RPC, so binary bytes have to ride as base64; that
+        inflates payload by ~33% (a 100 MB PDF becomes ~133 MB on the wire).
+        When the MCP server can read the file directly, prefer
+        `upload_document` instead. Hard limit: 500 MB raw.
 
         Args:
             filename: File name including extension (e.g. "quarterly.pdf").
@@ -224,9 +228,6 @@ def register_document_tools(mcp: FastMCP) -> None:
                 from `filename` and falls back to "application/octet-stream".
             should_summarize: If true, the backend generates an LLM summary
                 once processing completes.
-            use_vision_llm: If true and the file is image-bearing, use a
-                vision model to extract content.
-            processing_mode: One of "basic", "advanced".
 
         Returns:
             The raw JSON response from `/api/v1/documents/fileupload`,
@@ -249,6 +250,12 @@ def register_document_tools(mcp: FastMCP) -> None:
         if not file_bytes:
             raise ValueError("content_base64 decoded to zero bytes")
 
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"File '{filename}' is {len(file_bytes) / (1024 * 1024):.1f} MB, "
+                f"exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB per-file limit."
+            )
+
         resolved_mime = mime_type
         if not resolved_mime:
             guessed, _ = mimetypes.guess_type(filename)
@@ -260,8 +267,6 @@ def register_document_tools(mcp: FastMCP) -> None:
             data={
                 "search_space_id": str(search_space_id),
                 "should_summarize": str(should_summarize).lower(),
-                "use_vision_llm": str(use_vision_llm).lower(),
-                "processing_mode": processing_mode,
             },
             timeout=300.0,
         )

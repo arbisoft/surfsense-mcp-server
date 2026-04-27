@@ -22,9 +22,9 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SURFSENSE_PASSWORD", raising=False)
     monkeypatch.delenv("TOKEN_TTL", raising=False)
     # Reset the password-token cache so tests are independent.
-    from surfsense_mcp import client as _client_module
+    from surfsense_mcp import auth as _auth
 
-    _client_module.invalidate_password_token()
+    _auth.invalidate_password_token()
 
 
 @pytest.fixture

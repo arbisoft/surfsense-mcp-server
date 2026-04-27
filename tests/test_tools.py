@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastmcp import Client
 
-from surfsense_mcp import client as client_module
+from surfsense_mcp import auth as auth_module
 from surfsense_mcp.server import get_stdio_mcp
 from tests.conftest import FAKE_JWT, json_response
 
@@ -176,7 +176,6 @@ async def test_upload_document(mock_transport, tmp_path) -> None:
             "file_path": str(file_path),
             "search_space_id": 7,
             "should_summarize": False,
-            "processing_mode": "basic",
         },
     )
     assert data["document_ids"] == [99]
@@ -209,7 +208,6 @@ async def test_upload_document_content(mock_transport) -> None:
             "content_base64": encoded,
             "search_space_id": 7,
             "should_summarize": False,
-            "processing_mode": "basic",
         },
     )
     assert data["document_ids"] == [101]
@@ -260,6 +258,53 @@ async def test_upload_document_content_rejects_bad_base64(mock_transport) -> Non
                 },
             )
     assert "base64" in str(exc.value).lower()
+
+
+async def test_upload_document_rejects_oversized_file(mock_transport, tmp_path, monkeypatch) -> None:
+    from surfsense_mcp.tools import documents as documents_module
+
+    monkeypatch.setattr(documents_module, "MAX_UPLOAD_BYTES", 1024)
+
+    recorded = mock_transport(lambda req: json_response({}))
+    big = tmp_path / "big.bin"
+    with big.open("wb") as fh:
+        fh.seek(2048)
+        fh.write(b"\0")
+
+    mcp = get_stdio_mcp()
+    async with Client(mcp) as client:
+        with pytest.raises(Exception) as exc:
+            await client.call_tool(
+                "upload_document",
+                {"file_path": str(big), "search_space_id": 7},
+            )
+    assert "exceeds" in str(exc.value).lower()
+    assert recorded == []
+
+
+async def test_upload_document_content_rejects_oversized_payload(mock_transport, monkeypatch) -> None:
+    import base64
+
+    from surfsense_mcp.tools import documents as documents_module
+
+    monkeypatch.setattr(documents_module, "MAX_UPLOAD_BYTES", 1024)
+
+    recorded = mock_transport(lambda req: json_response({}))
+    encoded = base64.b64encode(b"x" * 2048).decode("ascii")
+
+    mcp = get_stdio_mcp()
+    async with Client(mcp) as client:
+        with pytest.raises(Exception) as exc:
+            await client.call_tool(
+                "upload_document_content",
+                {
+                    "filename": "big.pdf",
+                    "content_base64": encoded,
+                    "search_space_id": 7,
+                },
+            )
+    assert "exceeds" in str(exc.value).lower()
+    assert recorded == []
 
 
 async def test_update_document(mock_transport) -> None:
@@ -568,7 +613,7 @@ async def test_password_login_fallback(mock_transport, monkeypatch: pytest.Monke
     monkeypatch.delenv("SURFSENSE_JWT", raising=False)
     monkeypatch.setenv("SURFSENSE_EMAIL", "user@example.com")
     monkeypatch.setenv("SURFSENSE_PASSWORD", "hunter2")
-    client_module.invalidate_password_token()
+    auth_module.invalidate_password_token()
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path == "/auth/jwt/login":
@@ -596,7 +641,7 @@ async def test_password_login_retries_once_on_401(mock_transport, monkeypatch: p
     monkeypatch.delenv("SURFSENSE_JWT", raising=False)
     monkeypatch.setenv("SURFSENSE_EMAIL", "user@example.com")
     monkeypatch.setenv("SURFSENSE_PASSWORD", "hunter2")
-    client_module.invalidate_password_token()
+    auth_module.invalidate_password_token()
 
     login_counter = {"n": 0}
     api_counter = {"n": 0}

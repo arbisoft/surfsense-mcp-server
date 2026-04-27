@@ -17,6 +17,14 @@ from starlette.routing import Mount, Route
 
 from surfsense_mcp.server import get_header_mcp, get_stdio_mcp
 
+REQUIRED_HTTP_ENV_VARS = (
+    "MCP_BASE_URL",
+    "COGNITO_USER_POOL_ID",
+    "COGNITO_AWS_REGION",
+    "OIDC_CLIENT_ID",
+    "OIDC_CLIENT_SECRET",
+)
+
 
 class JSONFormatter(logging.Formatter):
     """JSON log formatter for structured logging."""
@@ -81,8 +89,7 @@ def resolve_cors_origins() -> list[str]:
 
     if env == "production":
         logger.warning(
-            "MCP_ALLOWED_ORIGINS is unset in production — defaulting to '*'. "
-            "Set MCP_ALLOWED_ORIGINS to restrict CORS."
+            "MCP_ALLOWED_ORIGINS is unset in production — defaulting to '*'. Set MCP_ALLOWED_ORIGINS to restrict CORS."
         )
     return ["*"]
 
@@ -108,6 +115,9 @@ def main() -> None:
         return
 
     if server_mode == ServerMode.HTTP:
+        missing = [name for name in REQUIRED_HTTP_ENV_VARS if not os.getenv(name)]
+        if missing:
+            raise ValueError("http mode is missing required env vars: " + ", ".join(missing))
         header_mcp = get_header_mcp()
         cors = [
             Middleware(
@@ -126,6 +136,9 @@ def main() -> None:
         ]
         header_app = header_mcp.http_app(middleware=cors, stateless_http=True)
 
+        # AWSCognitoProvider publishes /.well-known/oauth-protected-resource and
+        # /.well-known/oauth-authorization-server natively on the mounted app,
+        # so we only layer a /healthz probe in front of it.
         app = Starlette(
             routes=[
                 Route("/healthz", healthz, methods=["GET"]),

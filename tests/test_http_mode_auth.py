@@ -1,0 +1,167 @@
+"""HTTP-mode auth: the validated Cognito username drives X-Auth-Request-User.
+
+Contract: when an HTTP request reaches a tool, the Cognito access token (validated
+by FastMCP's ``AWSCognitoProvider`` via the pool's JWKS) lives at
+``get_access_token()`` and its filtered ``claims["username"]`` is forwarded to the
+SurfSense backend as ``X-Auth-Request-User``. No Bearer is sent on this leg — the
+MCP → SurfSense call goes direct on the docker network and relies on SurfSense's
+``ProxyAuthMiddleware`` to auto-provision the user from the header.
+"""
+
+from __future__ import annotations
+
+import time
+
+import httpx
+import pytest
+from fastmcp.server.auth.auth import AccessToken
+from mcp.server.auth.middleware.auth_context import auth_context_var
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+from surfsense_mcp import client as client_module
+
+
+def _set_request_token(token: AccessToken):
+    return auth_context_var.set(AuthenticatedUser(token))
+
+
+def _reset_request_token(reset_token):
+    auth_context_var.reset(reset_token)
+
+
+@pytest.fixture
+def cognito_access_token() -> AccessToken:
+    return AccessToken(
+        token="cognito-access-token-zzz",
+        client_id="mcp-client",
+        scopes=["openid"],
+        expires_at=int(time.time() + 3600),
+        claims={"sub": "abc-1234", "username": "alice"},
+    )
+
+
+def _install_mock_transport(monkeypatch, handler) -> None:
+    """Force every httpx.AsyncClient to route through the given handler."""
+    original_init = httpx.AsyncClient.__init__
+
+    def patched_init(self: httpx.AsyncClient, *args, **kwargs) -> None:
+        kwargs["transport"] = httpx.MockTransport(handler)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+
+
+async def test_http_request_injects_x_auth_request_user(monkeypatch, cognito_access_token):
+    """The username claim flows to SurfSense via X-Auth-Request-User, with no Bearer."""
+    monkeypatch.setenv("SURFSENSE_BASE_URL", "http://surfsense-backend:8000")
+    monkeypatch.delenv("SURFSENSE_JWT", raising=False)
+    # Tempt the password fallback path — HTTP mode must not touch it.
+    monkeypatch.setenv("SURFSENSE_EMAIL", "ops@example.com")
+    monkeypatch.setenv("SURFSENSE_PASSWORD", "shouldnotuse")
+
+    recorded: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded.append(request)
+        return httpx.Response(200, json=[{"id": 1, "name": "default"}])
+
+    _install_mock_transport(monkeypatch, handler)
+
+    reset = _set_request_token(cognito_access_token)
+    try:
+        response = await client_module.authed_request("GET", "/api/v1/searchspaces")
+    finally:
+        _reset_request_token(reset)
+
+    assert response.status_code == 200
+    assert len(recorded) == 1
+    req = recorded[0]
+    assert req.url.path == "/api/v1/searchspaces"
+    # ProxyAuthMiddleware reads X-Auth-Request-User and synthesizes the email.
+    assert req.headers["x-auth-request-user"] == "alice"
+    # The Cognito Bearer is NOT forwarded — SurfSense auth is header-based here.
+    assert "authorization" not in {k.lower() for k in req.headers}
+
+
+def test_get_header_mcp_wires_aws_cognito_provider(monkeypatch):
+    """``get_header_mcp()`` builds the FastMCP HTTP factory with all the
+    AWSCognitoProvider knobs we depend on: the redirect path Cognito calls
+    back, ``forward_resource=False`` (Cognito User Pools don't honor RFC 8707),
+    and the localhost-only DCR redirect allow-list when
+    ``MCP_ALLOWED_CLIENT_REDIRECT_URIS`` is empty.
+
+    OIDC discovery happens at provider construction (``OIDCProxy.__init__``
+    issues a synchronous ``httpx.get`` to the Cognito ``/.well-known/openid-
+    configuration`` URL), so we intercept that call with a stub document
+    instead of hitting the real Cognito service.
+    """
+    import httpx as httpx_module
+    from fastmcp.server.auth.providers.aws import AWSCognitoProvider
+
+    from surfsense_mcp import server as server_module
+
+    monkeypatch.setenv("COGNITO_USER_POOL_ID", "ap-southeast-1_TEST123")
+    monkeypatch.setenv("COGNITO_AWS_REGION", "ap-southeast-1")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.setenv("MCP_BASE_URL", "https://mcp.test.example.com")
+    monkeypatch.delenv("MCP_ALLOWED_CLIENT_REDIRECT_URIS", raising=False)
+
+    pool_url = "https://cognito-idp.ap-southeast-1.amazonaws.com/ap-southeast-1_TEST123"
+    discovery_doc = {
+        "issuer": pool_url,
+        "authorization_endpoint": f"{pool_url}/oauth2/authorize",
+        "token_endpoint": f"{pool_url}/oauth2/token",
+        "jwks_uri": f"{pool_url}/.well-known/jwks.json",
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+    }
+
+    def _stub_discovery(url, **kwargs):
+        return httpx_module.Response(200, json=discovery_doc, request=httpx_module.Request("GET", url))
+
+    monkeypatch.setattr(httpx_module, "get", _stub_discovery)
+
+    mcp = server_module.get_header_mcp()
+
+    assert isinstance(mcp.auth, AWSCognitoProvider)
+    assert mcp.auth._redirect_path == "/auth/callback"
+    assert mcp.auth._forward_resource is False
+    # Empty MCP_ALLOWED_CLIENT_REDIRECT_URIS → localhost-only defaults
+    # (Claude Desktop / Cursor / MCP Inspector all redirect to loopback).
+    assert mcp.auth._allowed_client_redirect_uris == [
+        "http://localhost:*/*",
+        "http://127.0.0.1:*/*",
+    ]
+
+
+async def test_http_request_raises_when_username_missing(monkeypatch):
+    """An AccessToken with no username claim is a hard error, not a silent fallback."""
+    monkeypatch.setenv("SURFSENSE_BASE_URL", "http://surfsense-backend:8000")
+    monkeypatch.delenv("SURFSENSE_JWT", raising=False)
+
+    recorded: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded.append(request)
+        return httpx.Response(200, json=[])
+
+    _install_mock_transport(monkeypatch, handler)
+
+    token_without_username = AccessToken(
+        token="cognito-access-token-zzz",
+        client_id="mcp-client",
+        scopes=["openid"],
+        expires_at=int(time.time() + 3600),
+        claims={"sub": "abc-1234"},
+    )
+    reset = _set_request_token(token_without_username)
+    try:
+        with pytest.raises(RuntimeError, match="username claim missing"):
+            await client_module.authed_request("GET", "/api/v1/searchspaces")
+    finally:
+        _reset_request_token(reset)
+
+    # The request must not have been sent at all.
+    assert recorded == []

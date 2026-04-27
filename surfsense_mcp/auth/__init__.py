@@ -1,5 +1,52 @@
-"""Authentication providers for the SurfSense MCP Server."""
+"""Per-request auth headers for SurfSense backend calls.
 
-from surfsense_mcp.auth.surfsense_header_auth_provider import SurfSenseHeaderAuthProvider
+Two transports, two strategies:
 
-__all__ = ["SurfSenseHeaderAuthProvider"]
+- **stdio** (single-user, on a developer's laptop) → ``Authorization: Bearer
+  <surfsense-jwt>`` from ``SURFSENSE_JWT`` or the password fallback.
+- **http** (multi-user, behind FastMCP's ``AWSCognitoProvider``) →
+  ``X-Auth-Request-User`` derived from the validated Cognito token's
+  ``username`` claim. The Cognito Bearer is *not* forwarded.
+
+The dispatcher in :func:`build_auth_headers` picks based on whether a FastMCP
+HTTP request scope is active. See :mod:`surfsense_mcp.auth.stdio` and
+:mod:`surfsense_mcp.auth.http` for the per-mode internals.
+"""
+
+from __future__ import annotations
+
+from surfsense_mcp.auth import http as _http
+from surfsense_mcp.auth import stdio as _stdio
+
+__all__ = [
+    "auth_came_from_password",
+    "build_auth_headers",
+    "invalidate_password_token",
+]
+
+
+async def build_auth_headers() -> dict[str, str]:
+    """Return the auth header(s) to attach to the next SurfSense backend call."""
+    token = _http.request_token()
+    if token is not None:
+        return _http.username_header(token)
+    return {"Authorization": f"Bearer {await _stdio.resolve_jwt()}"}
+
+
+def auth_came_from_password() -> bool:
+    """Gate the 401-retry-once path.
+
+    HTTP mode: never retry — a 401 means the Cognito token validated fine but
+    the backend rejected the user (real provisioning failure), and we want to
+    surface that. Stdio with a paste JWT: never retry — the user pastes a new
+    one. Stdio with password fallback: retry — the cached token may have
+    expired server-side before our local TTL.
+    """
+    if _http.request_token() is not None:
+        return False
+    return _stdio.is_password_in_use()
+
+
+def invalidate_password_token() -> None:
+    """Drop the stdio password-cache so the next call forces a fresh login."""
+    _stdio.invalidate_cache()

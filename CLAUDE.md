@@ -18,10 +18,11 @@ surfsense-mcp-server/
 │   ├── __init__.py
 │   ├── __main__.py                        # CLI entry: ServerMode enum (stdio|http), JSON logging
 │   ├── server.py                          # get_stdio_mcp() / get_header_mcp() factories
-│   ├── client.py                          # get_surfsense_client_context() → httpx.AsyncClient
+│   ├── client.py                          # httpx wiring + retry; no auth (see auth/)
 │   ├── auth/
-│   │   ├── __init__.py
-│   │   └── surfsense_header_auth_provider.py  # TokenVerifier — validates JWT via GET /users/me
+│   │   ├── __init__.py                    # build_auth_headers() dispatcher + retry-gate
+│   │   ├── stdio.py                       # SURFSENSE_JWT / password fallback / cache
+│   │   └── http.py                        # FastMCP AccessToken → X-Auth-Request-User
 │   └── tools/
 │       ├── __init__.py                    # register_tools(mcp) — calls all per-module register fns
 │       ├── search_spaces.py               # list / get / create / update / delete
@@ -60,26 +61,56 @@ SURFSENSE_BASE_URL=http://localhost:8000 \
 SURFSENSE_EMAIL=admin@example.com SURFSENSE_PASSWORD=<pw> \
 python -m surfsense_mcp stdio
 
-# Run HTTP mode
-SURFSENSE_BASE_URL=http://localhost:8000 python -m surfsense_mcp http   # binds :8211
+# Run HTTP mode (multi-user, auto-OAuth via AWSCognitoProvider)
+# In the devstack this points at the internal backend DNS; locally
+# running outside docker can target a public SurfSense URL.
+SURFSENSE_BASE_URL=http://surfsense-backend:8000 \
+MCP_BASE_URL=https://foss-research-mcp.local.moneta.dev \
+COGNITO_USER_POOL_ID=ap-southeast-1_XXXXX \
+COGNITO_AWS_REGION=ap-southeast-1 \
+OIDC_CLIENT_ID=...        \
+OIDC_CLIENT_SECRET=...    \
+python -m surfsense_mcp http   # binds :8211
 ```
+
+In the Moneta devstack everything except `OIDC_CLIENT_ID/SECRET` and
+`OIDC_BASE_URI` is auto-derived (`make dev.setup`). One manual step in
+the AWS Console: add `${MCP_BASE_URL}/auth/callback` to the Cognito app
+client's allowed callback URLs (no new client required).
 
 ## Architecture
 
 ### Transport modes
 
-- **stdio** — used by Claude Desktop / Cursor / VS Code. `SURFSENSE_JWT` env var carries the token. `get_stdio_mcp()` builds a FastMCP instance without an auth provider; the JWT is read directly from env in `client.py`.
-- **http** — for remote deploys. `get_header_mcp()` attaches `SurfSenseHeaderAuthProvider` which validates each request's `Authorization: Bearer` header against `GET /users/me`. CORS is configured via `http_app(middleware=[...])`. Port: `8211`.
+- **stdio** — single-user, per-developer install (Claude Desktop / Cursor / VS Code on a laptop). `SURFSENSE_JWT` env var carries the token; password fallback (`SURFSENSE_EMAIL` + `SURFSENSE_PASSWORD`) is available for CI / long-running sessions. `get_stdio_mcp()` builds a FastMCP instance without an auth provider; the JWT is read directly in `client.py` and sent as `Authorization: Bearer`.
+- **http** — multi-user, hosted. `get_header_mcp()` attaches FastMCP's `AWSCognitoProvider`, which makes the service itself a full OAuth 2.0 authorization server: it publishes `/.well-known/oauth-authorization-server` + `/.well-known/oauth-protected-resource` (RFC 8414 / 9728), implements the `/register` DCR shim over the pre-registered Cognito app client (RFC 7591), and proxies `/authorize` / `/auth/callback` / `/token` to Cognito. MCP clients (Claude Desktop / Cursor) discover all of this and run the OAuth flow automatically — no manual Bearer paste. Port: `8211`. This service is **not** behind mPass; FastMCP is the sole auth layer. The MCP → SurfSense call goes direct on the docker network (`http://surfsense-backend:8000`) with the MCP server injecting `X-Auth-Request-User` from the validated token's `username` claim; SurfSense's `ProxyAuthMiddleware` synthesizes the email and auto-provisions the user.
 
 ### Auth model
 
-SurfSense issues short-lived JWTs from `fastapi-users` (no API-key concept). Two input paths are supported; the stdio password fallback is optional.
+SurfSense issues short-lived JWTs from `fastapi-users` (no API-key concept). The MCP server talks to SurfSense either with a fastapi-users JWT (stdio) or with a trusted identity header (HTTP) depending on transport.
 
 - **stdio (primary):** JWT from `SURFSENSE_JWT` env var — user pastes a fresh one when it expires. No refresh.
 - **stdio (optional fallback):** if `SURFSENSE_JWT` is unset and `SURFSENSE_EMAIL` + `SURFSENSE_PASSWORD` are set, the client calls `POST /auth/jwt/login`, caches the token for `TOKEN_TTL` seconds (default 3300 = 55 min), and auto-re-authenticates once on 401. Intended for CI / long-running stdio sessions.
-- **http:** JWT from `Authorization: Bearer` request header; validated by `SurfSenseHeaderAuthProvider` calling `GET /users/me`. Password fallback is **not** enabled in HTTP mode — the Bearer identity must come from the caller.
+- **http:** `AWSCognitoProvider` validates the inbound Cognito Bearer against the pool's JWKS and exposes the filtered claims via `get_access_token()`. `auth/http.py:username_header()` reads `claims["username"]` and the dispatcher forwards it as `X-Auth-Request-User` to SurfSense — the backend's `ProxyAuthMiddleware` does the rest. The Cognito Bearer itself is **not** forwarded; the internal-network call to SurfSense carries only the header. No SurfSense JWT minting, no caching.
 
-`get_surfsense_client_context()` in `client.py` resolves the token in this order: FastMCP request-scoped `get_access_token()` → `SURFSENSE_JWT` env → password login (if creds present). On 401 in password mode only, re-authenticate once and retry; otherwise raise.
+`auth/__init__.py:build_auth_headers()` is the dispatcher: if an HTTP request token is in scope (`auth/http.py:request_token()` returns non-None), it returns `{X-Auth-Request-User: <username>}`; otherwise it returns `{Authorization: Bearer <surfsense-jwt>}` from `auth/stdio.py:resolve_jwt()`. The 401-retry-once path (gated by `auth_came_from_password()`) fires only in stdio password mode — HTTP-mode 401s are surfaced unchanged because they indicate a real provisioning failure, not a stale token.
+
+### Connecting Claude Desktop / Cursor (HTTP mode)
+
+Add a "Custom connector" in Claude Desktop / Cursor pointing at
+`https://<host>/mcp`. The client will:
+
+1. Hit `/mcp`, receive `401 WWW-Authenticate: Bearer resource_metadata="…"`.
+2. Fetch `/.well-known/oauth-protected-resource` and `/.well-known/oauth-authorization-server` — both published by `AWSCognitoProvider` automatically.
+3. `POST /register` — FastMCP's DCR shim returns a client registration backed by the single pre-registered Cognito app client (no new Cognito client per MCP consumer; Cognito has no DCR of its own).
+4. Open a browser to `/authorize` (PKCE) which redirects to Cognito. User logs in. Cognito redirects back to `/auth/callback`.
+5. Exchange the code for tokens at `/token`. The Cognito access token is returned to the MCP client, which sends it as `Authorization: Bearer` on every `/mcp` call.
+
+No manual Bearer paste and no Cognito client config needed on the MCP client side — the DCR shim handles it.
+
+**One-time AWS Console prerequisite:** on the existing Cognito app client (`OIDC_CLIENT_ID`), add `${MCP_BASE_URL}/auth/callback` to the allowed callback URLs and ensure `authorization_code` is in the enabled grant types. No new app client, no new secret.
+
+**MCP Inspector for local dev:** `npx @modelcontextprotocol/inspector`, transport "Streamable HTTP", URL `https://foss-research-mcp.local.moneta.dev/mcp` — Inspector follows the same discovery + OAuth flow.
 
 ### Tool conventions
 
@@ -112,8 +143,26 @@ app = header_mcp.http_app(middleware=cors)  # different signature
 - **No backend changes** — all tools must call routes that already exist in `surfsense_backend`. Verify in `surfsense_backend/app/routes/` before adding any tool. If a route is missing, drop the tool — do not add one to the backend.
 - **No new MCP resources** — tools only.
 - **No Pydantic re-modeling** — return raw dicts from httpx responses. SurfSense's schemas are not imported here.
-- **No token refresh in JWT-paste mode** — the server does not attempt to refresh `SURFSENSE_JWT`. Expiry surfaces to the MCP client as a 401. Password-fallback mode is the only path with auto-reauth.
-- **HTTP mode never uses password login** — only stdio is allowed to log in with email/password, to keep the Bearer-validated HTTP surface identity-bound to the caller.
+- **No token refresh in JWT-paste mode** — the server does not attempt to refresh `SURFSENSE_JWT`. Expiry surfaces to the MCP client as a 401. Password-fallback mode (stdio) is the only path with auto-reauth; HTTP mode relies on the MCP client (Claude Desktop / Cursor) to refresh its Cognito token via the OAuth refresh flow.
+- **HTTP mode never uses password login** — only stdio is allowed to log in with email/password. HTTP requests must arrive with a Cognito-issued Bearer JWT validated by `AWSCognitoProvider`.
+- **HTTP mode never forwards the Cognito Bearer to SurfSense** — identity is carried via `X-Auth-Request-User`. The internal-network call to `surfsense-backend:8000` relies on the network boundary (no host port published) as its trust boundary, matching how oauth2-proxy injects headers for the web apps.
+
+## Binary uploads & MCP transport limits
+
+Two upload tools live in `surfsense_mcp/tools/documents.py`:
+
+- `upload_document(file_path, ...)` — for stdio or any context where the MCP server can read the file off disk. Preferred when available; no encoding overhead.
+- `upload_document_content(filename, content_base64, ...)` — for chat attachments and HTTP-mode callers without disk access. Bytes ride as base64 inside the JSON-RPC `tools/call` arguments.
+
+Both enforce a 500 MB per-file ceiling that mirrors `surfsense_backend/app/routes/documents_routes.py:53` (`MAX_FILE_SIZE_BYTES`).
+
+**Why base64 at the MCP boundary, not multipart.** MCP is JSON-RPC 2.0 — every tool argument must be JSON-serializable. FastMCP v3 has no input-side binary type: `fastmcp/utilities/types.py:238-276` ships only output helpers (`Image` / `Audio` / `File`), and `fastmcp/tools/function_parsing.py:43-50` actively replaces `bytes` in tool input schemas with `_UnserializableType`. Base64 inside a JSON string is the only available channel for inline bytes.
+
+**Why we don't add a sidecar `POST /upload` route on the HTTP app.** Mechanically easy — drop a `Route("/upload", ...)` next to `/healthz` in `surfsense_mcp/__main__.py:117-148` (~80 LOC + a JWKS-validating dependency, since FastMCP's `get_access_token()` only resolves inside a tool-call scope and can't be reused from a Starlette route). But it does not help the primary use case. Claude Desktop / Cursor / Windsurf only emit `tools/call`; they will not autonomously `PUT` chat-attached bytes to a non-MCP URL — tool *results* are returned to the model as text/structured content, not as instructions the host acts on. The endpoint would only benefit programmatic / curl-style callers, which didn't justify the duplicate auth surface or a second supported transport for uploads.
+
+**What would change this decision.** Two concrete signals to watch: (a) the MCP spec adds a binary input frame or sanctions out-of-band upload triggers in tool results; (b) Claude Desktop / Cursor ship a feature that lets a tool result instruct the host to upload a referenced attachment to a URL. Until then, base64 stays.
+
+**Do-not-change pointers.** Do not add a `Route("/upload", ...)` in `__main__.py` unless one of the signals above lands. Do not try to switch the tool inputs to a `bytes`-typed parameter — `function_parsing.py:43-50` will reject it. The existing 500 MB guard in `surfsense_mcp/tools/documents.py` is the correct upper bound and matches the backend; lowering it requires a backend-side change to match.
 
 ## Relevant SurfSense backend files
 
