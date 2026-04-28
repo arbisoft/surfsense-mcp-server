@@ -20,6 +20,20 @@ _DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS: tuple[str, ...] = (
     "http://127.0.0.1:*/*",
 )
 
+_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+
+def _log_payloads_enabled() -> bool:
+    """Whether the structured-logging middleware should include tool payloads.
+
+    Default is False because tool inputs/outputs include chat prompts,
+    document bodies, and base64-encoded uploads (up to 500 MB) — logging
+    those by default would leak sensitive user data and balloon log
+    volume. Operators can opt in via MCP_LOG_PAYLOADS=1 for short
+    debugging windows.
+    """
+    return os.getenv("MCP_LOG_PAYLOADS", "").strip().lower() in _TRUTHY_ENV_VALUES
+
 
 def _allowed_client_redirect_uris() -> list[str]:
     """Parse MCP_ALLOWED_CLIENT_REDIRECT_URIS (comma-separated).
@@ -75,7 +89,7 @@ def get_header_mcp() -> FastMCP:
         website_url="https://surfsense.net",
         auth=provider,
     )
-    mcp.add_middleware(StructuredLoggingMiddleware(include_payloads=True))
+    mcp.add_middleware(StructuredLoggingMiddleware(include_payloads=_log_payloads_enabled()))
     register_tools(mcp)
     return mcp
 
@@ -88,6 +102,6 @@ def get_stdio_mcp() -> FastMCP:
     ``surfsense_mcp.auth.stdio``.
     """
     mcp = FastMCP("SurfSense MCP Server (stdio)", icons=[ICON])
-    mcp.add_middleware(StructuredLoggingMiddleware(include_payloads=True))
+    mcp.add_middleware(StructuredLoggingMiddleware(include_payloads=_log_payloads_enabled()))
     register_tools(mcp)
     return mcp
