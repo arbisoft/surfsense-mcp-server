@@ -260,6 +260,48 @@ async def test_upload_document_content_rejects_bad_base64(mock_transport) -> Non
     assert "base64" in str(exc.value).lower()
 
 
+async def test_upload_document_retries_with_full_body_on_401(
+    mock_transport, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Streaming uploads (file handle, not bytes) must be rewound between
+    401 retry attempts — otherwise the second POST sends an empty body."""
+    monkeypatch.delenv("SURFSENSE_JWT", raising=False)
+    monkeypatch.setenv("SURFSENSE_EMAIL", "user@example.com")
+    monkeypatch.setenv("SURFSENSE_PASSWORD", "hunter2")
+    auth_module.invalidate_password_token()
+
+    file_path = tmp_path / "notes.md"
+    file_path.write_text("# hello streaming world\n", encoding="utf-8")
+
+    upload_attempts: list[bytes] = []
+    api_counter = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/auth/jwt/login":
+            n = len(upload_attempts) + 1
+            return httpx.Response(200, json={"access_token": f"token-v{n}", "token_type": "bearer"})
+        if req.url.path == "/api/v1/documents/fileupload":
+            api_counter["n"] += 1
+            upload_attempts.append(req.content)
+            if api_counter["n"] == 1:
+                return httpx.Response(401, json={"detail": "expired"})
+            return httpx.Response(200, json={"document_ids": [1], "status": "ok"})
+        return httpx.Response(500, json={"detail": "unexpected"})
+
+    mock_transport(handler)
+
+    data = await _call_tool(
+        "upload_document",
+        {"file_path": str(file_path), "search_space_id": 7, "should_summarize": False},
+    )
+    assert data["document_ids"] == [1]
+    assert len(upload_attempts) == 2
+    # Both attempts must carry the actual file payload — the retry would
+    # silently send an empty body if the file handle weren't rewound.
+    for body in upload_attempts:
+        assert b"# hello streaming world" in body
+
+
 async def test_upload_document_rejects_oversized_file(mock_transport, tmp_path, monkeypatch) -> None:
     from surfsense_mcp.tools import documents as documents_module
 

@@ -11,7 +11,7 @@ per-mode credential resolution lives in :mod:`surfsense_mcp.auth` (see
 from __future__ import annotations
 
 import os
-from typing import NamedTuple
+from typing import IO, NamedTuple
 
 import httpx
 from fastmcp.utilities.logging import get_logger
@@ -86,16 +86,26 @@ async def authed_request(
 async def authed_multipart_post(
     path: str,
     *,
-    files: dict[str, tuple[str, bytes, str]],
+    files: dict[str, tuple[str, IO[bytes] | bytes, str]],
     data: dict[str, str] | None = None,
     timeout: float | None = None,
 ) -> httpx.Response:
     """Multipart POST with 401-retry-once. Used by document uploads.
 
     The shared client context's JSON Content-Type would break multipart, so
-    this helper drives its own AsyncClient.
+    this helper drives its own AsyncClient. ``files`` values may be raw
+    bytes or seekable binary file objects — passing a file object lets
+    httpx stream the body without loading it into memory.
     """
     request_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT_SECONDS
+
+    def _rewind_files() -> None:
+        # The first POST consumed any file-like body; on retry we must rewind
+        # or httpx would upload an empty multipart payload.
+        for _, body, _ in files.values():
+            seek = getattr(body, "seek", None)
+            if callable(seek):
+                seek(0)
 
     async def _do() -> httpx.Response:
         auth_headers = await _auth.build_auth_headers()
@@ -110,6 +120,7 @@ async def authed_multipart_post(
     if response.status_code == 401 and _auth.auth_came_from_password():
         logger.info("401 with password auth on multipart — invalidating and retrying")
         _auth.invalidate_password_token()
+        _rewind_files()
         response = await _do()
     response.raise_for_status()
     return response

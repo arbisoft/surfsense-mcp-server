@@ -186,17 +186,19 @@ def register_document_tools(mcp: FastMCP) -> None:
         mime_type, _ = mimetypes.guess_type(str(path))
         mime_type = mime_type or "application/octet-stream"
 
-        content = path.read_bytes()
-
-        response = await authed_multipart_post(
-            "/api/v1/documents/fileupload",
-            files={"files": (path.name, content, mime_type)},
-            data={
-                "search_space_id": str(search_space_id),
-                "should_summarize": str(should_summarize).lower(),
-            },
-            timeout=300.0,
-        )
+        # Stream from disk rather than read_bytes() — uploads can be up to
+        # 500 MB, and HTTP-mode runs in a container where buffering the
+        # whole payload in RAM risks OOM under concurrent uploads.
+        with path.open("rb") as file_obj:
+            response = await authed_multipart_post(
+                "/api/v1/documents/fileupload",
+                files={"files": (path.name, file_obj, mime_type)},
+                data={
+                    "search_space_id": str(search_space_id),
+                    "should_summarize": str(should_summarize).lower(),
+                },
+                timeout=300.0,
+            )
         return response.json()
 
     @mcp.tool()
