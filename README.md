@@ -15,7 +15,7 @@ Read:
 | `get_document` / `get_recent_documents` / `list_documents` | Fetch documents by id / list recent / list all. |
 | `get_document_status` / `get_document_type_counts` | Per-space ingestion counters. |
 | `list_research_threads` / `get_research_thread` / `get_thread_messages` | Browse chat/research threads. |
-| `list_reports` / `get_report_content` / `export_report` | Browse and export research reports. |
+| `list_reports` / `get_report` / `get_report_content` / `export_report` | Browse and export research reports. |
 | `get_logs` | Fetch backend log entries (operator tool). |
 
 Write:
@@ -26,8 +26,8 @@ Write:
 | `upload_document` | Upload a file from disk (multipart, no base64 inflation). |
 | `upload_document_content` | Upload bytes inline as base64 (chat attachments / no-disk callers). |
 | `update_document` / `delete_document` | Modify or remove a document. |
-| `delete_thread` / `delete_report` | Remove threads or reports. |
-| `create_note` | Add a note to a search space. |
+| `delete_research_thread` / `delete_report` | Remove threads or reports. |
+| `create_note` / `delete_note` | Add or remove a note in a search space. |
 
 Chat (streaming):
 
