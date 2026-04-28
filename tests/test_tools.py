@@ -591,7 +591,7 @@ async def test_export_report_streams_size_from_chunks_without_content_length(moc
     wire rather than buffering the full export in memory."""
     payload = b"X" * 4096
 
-    async def astream() -> Any:
+    async def astream():
         yield payload[:1024]
         yield payload[1024:3072]
         yield payload[3072:]
