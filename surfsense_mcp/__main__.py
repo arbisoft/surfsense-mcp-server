@@ -68,7 +68,12 @@ class JSONFormatter(logging.Formatter):
 
 
 def configure_json_logging() -> None:
-    """Replace FastMCP's Rich handlers with a JSON formatter on the fastmcp logger."""
+    """Replace FastMCP's Rich handlers with a JSON formatter on the fastmcp logger.
+
+    Called from :func:`main`, not at import time — importing this module
+    must not mutate global logging handlers (would leak across tests and
+    any in-process consumer that imports the package).
+    """
     fastmcp_logger = logging.getLogger("fastmcp")
 
     for handler in fastmcp_logger.handlers[:]:
@@ -80,8 +85,6 @@ def configure_json_logging() -> None:
     fastmcp_logger.setLevel(logging.INFO)
     fastmcp_logger.propagate = False
 
-
-configure_json_logging()
 
 logger = logging.getLogger("fastmcp.surfsense_mcp")
 
@@ -119,6 +122,8 @@ def resolve_cors_origins() -> list[str]:
 
 def main() -> None:
     """Run the MCP server."""
+    configure_json_logging()
+
     server_mode = ServerMode.STDIO
     if len(sys.argv) > 1:
         server_mode = ServerMode(sys.argv[1])
