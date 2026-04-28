@@ -30,8 +30,10 @@ USER mcp
 # Expose port for HTTP transports (SSE, streamable-http, http)
 EXPOSE 8211
 
-# Set environment variables with defaults
-ENV FASTMCP_PORT=8211
+# Listener port. Read by surfsense_mcp.__main__.resolve_http_port(); the
+# HEALTHCHECK below resolves it via the shell at runtime so changes here
+# stay consistent without rebuilding.
+ENV MCP_HTTP_PORT=8211
 
 # Default to streamable-http transport, but allow override via command
 # Users can override by passing different transport as CMD
@@ -39,4 +41,4 @@ ENTRYPOINT ["python", "-m", "surfsense_mcp"]
 CMD ["http"]
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=10 \
-    CMD curl -fsS http://127.0.0.1:8211/healthz || exit 1
+    CMD curl -fsS "http://127.0.0.1:${MCP_HTTP_PORT:-8211}/healthz" || exit 1

@@ -25,6 +25,29 @@ REQUIRED_HTTP_ENV_VARS = (
     "OIDC_CLIENT_SECRET",
 )
 
+DEFAULT_HTTP_PORT = 8211
+
+
+def resolve_http_port() -> int:
+    """Resolve the HTTP listener port from MCP_HTTP_PORT (default 8211).
+
+    Garbage values fall back to the default rather than crashing the
+    container at boot — operators who mistype the env var get a usable
+    server they can then reconfigure.
+    """
+    raw = os.getenv("MCP_HTTP_PORT", "").strip()
+    if not raw:
+        return DEFAULT_HTTP_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        logger.warning("MCP_HTTP_PORT=%r is not an integer; using default %d", raw, DEFAULT_HTTP_PORT)
+        return DEFAULT_HTTP_PORT
+    if not (1 <= port <= 65535):
+        logger.warning("MCP_HTTP_PORT=%d is out of range; using default %d", port, DEFAULT_HTTP_PORT)
+        return DEFAULT_HTTP_PORT
+    return port
+
 
 class JSONFormatter(logging.Formatter):
     """JSON log formatter for structured logging."""
@@ -155,8 +178,9 @@ def main() -> None:
             uv_handler.setFormatter(JSONFormatter())
             uv_logger.addHandler(uv_handler)
 
-        logger.info("Starting HTTP server on :8211")
-        uvicorn.run(app, host="0.0.0.0", port=8211, log_level="info", access_log=False)
+        port = resolve_http_port()
+        logger.info("Starting HTTP server on :%d", port)
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=False)
         return
 
 
