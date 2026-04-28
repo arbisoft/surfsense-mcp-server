@@ -6,7 +6,7 @@ from fastmcp import FastMCP
 
 from surfsense_mcp.client import (
     authed_request,
-    get_surfsense_client_context,
+    stream_authed_get,
 )
 
 VALID_EXPORT_FORMATS = {"pdf", "docx", "html", "latex", "epub", "odt", "plain"}
@@ -88,35 +88,31 @@ def register_report_tools(mcp: FastMCP) -> None:
         if fmt not in VALID_EXPORT_FORMATS:
             raise ValueError(f"Unsupported export format '{format}'. Valid options: {sorted(VALID_EXPORT_FORMATS)}")
 
-        ctx = await get_surfsense_client_context()
-        async with ctx.client as client:
-            # Stream rather than .get() — exports can be many MB and we only
-            # need headers + size. With Content-Length we discard the body
-            # entirely; without it we count chunks on the wire so we never
-            # buffer the full export in RAM.
-            async with client.stream(
-                "GET",
-                f"/api/v1/reports/{report_id}/export",
-                params={"format": fmt},
-            ) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "application/octet-stream")
-                disposition = response.headers.get("content-disposition") or ""
-                filename: str | None = None
-                if "filename=" in disposition:
-                    filename = disposition.split("filename=", 1)[1].strip().strip('"')
+        # Stream via the shared helper — exports can be many MB and we only
+        # need headers + size. stream_authed_get() also gives us the
+        # 401-retry-once behavior on stdio password mode (without it, exports
+        # would be the only tool that fails on a stale cached token).
+        async with stream_authed_get(
+            f"/api/v1/reports/{report_id}/export",
+            params={"format": fmt},
+        ) as response:
+            content_type = response.headers.get("content-type", "application/octet-stream")
+            disposition = response.headers.get("content-disposition") or ""
+            filename: str | None = None
+            if "filename=" in disposition:
+                filename = disposition.split("filename=", 1)[1].strip().strip('"')
 
-                size_bytes: int | None = None
-                content_length = response.headers.get("content-length")
-                if content_length is not None:
-                    try:
-                        size_bytes = int(content_length)
-                    except ValueError:
-                        size_bytes = None
-                if size_bytes is None:
-                    size_bytes = 0
-                    async for chunk in response.aiter_bytes():
-                        size_bytes += len(chunk)
+            size_bytes: int | None = None
+            content_length = response.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    size_bytes = int(content_length)
+                except ValueError:
+                    size_bytes = None
+            if size_bytes is None:
+                size_bytes = 0
+                async for chunk in response.aiter_bytes():
+                    size_bytes += len(chunk)
 
         return {
             "report_id": report_id,

@@ -130,23 +130,33 @@ class _StreamContext:
     """Async context manager that yields an httpx streaming response and
     retries once on 401 if stdio password auth is in use.
 
-    Use as::
-
-        async with stream_authed_post(path, json=payload) as response:
-            async for line in response.aiter_lines():
-                ...
+    Generic across methods + bodies — used both for SSE chat (POST + JSON
+    body, ``Accept: text/event-stream``) and for binary export streams
+    (GET + query params). Tools should reach for :func:`stream_authed_post`
+    or :func:`stream_authed_get` rather than constructing this directly.
     """
 
-    def __init__(self, path: str, json: object) -> None:
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: object | None = None,
+        params: dict | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        self._method = method
         self._path = path
         self._json = json
+        self._params = params
+        self._extra_headers = extra_headers or {}
         self._client: httpx.AsyncClient | None = None
         self._response: httpx.Response | None = None
 
     async def __aenter__(self) -> httpx.Response:
         self._response = await self._open()
         if self._response.status_code == 401 and _auth.auth_came_from_password():
-            logger.info("401 with password auth on SSE — invalidating and retrying")
+            logger.info("401 with password auth on stream — invalidating and retrying")
             await self._close_active()
             _auth.invalidate_password_token()
             self._response = await self._open()
@@ -161,13 +171,11 @@ class _StreamContext:
         self._client = httpx.AsyncClient(
             base_url=_base_url(),
             timeout=httpx.Timeout(DEFAULT_TIMEOUT_SECONDS, read=None),
-            headers={
-                **auth_headers,
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
+            headers={**auth_headers, **self._extra_headers},
         )
-        request = self._client.build_request("POST", self._path, json=self._json)
+        request = self._client.build_request(
+            self._method, self._path, json=self._json, params=self._params
+        )
         return await self._client.send(request, stream=True)
 
     async def _close_active(self) -> None:
@@ -187,4 +195,16 @@ class _StreamContext:
 
 def stream_authed_post(path: str, *, json: object) -> _StreamContext:
     """Open an SSE stream with auth + 401-retry. Caller uses ``async with``."""
-    return _StreamContext(path, json)
+    return _StreamContext(
+        "POST",
+        path,
+        json=json,
+        extra_headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+
+
+def stream_authed_get(path: str, *, params: dict | None = None) -> _StreamContext:
+    """Open a streaming GET with auth + 401-retry. Used for binary endpoints
+    (e.g. report export) where we want headers + size without buffering the
+    full body."""
+    return _StreamContext("GET", path, params=params)

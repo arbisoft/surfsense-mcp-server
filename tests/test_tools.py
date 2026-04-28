@@ -616,6 +616,51 @@ async def test_export_report_streams_size_from_chunks_without_content_length(moc
     assert data["content_type"] == "application/pdf"
 
 
+async def test_export_report_retries_once_on_401_in_password_mode(
+    mock_transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stale cached password token → /export 401 → invalidate → re-login →
+    retry. Without sharing the retry helper, exports are the one tool that
+    silently fails in long-running stdio sessions."""
+    monkeypatch.delenv("SURFSENSE_JWT", raising=False)
+    monkeypatch.setenv("SURFSENSE_EMAIL", "user@example.com")
+    monkeypatch.setenv("SURFSENSE_PASSWORD", "hunter2")
+    auth_module.invalidate_password_token()
+
+    login_counter = {"n": 0}
+    export_counter = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/auth/jwt/login":
+            login_counter["n"] += 1
+            return httpx.Response(
+                200,
+                json={"access_token": f"token-v{login_counter['n']}", "token_type": "bearer"},
+            )
+        if req.url.path == "/api/v1/reports/5/export":
+            export_counter["n"] += 1
+            if export_counter["n"] == 1:
+                assert req.headers["Authorization"] == "Bearer token-v1"
+                return httpx.Response(401, json={"detail": "expired"})
+            assert req.headers["Authorization"] == "Bearer token-v2"
+            return httpx.Response(
+                200,
+                content=b"%PDF-1.4 retry-payload",
+                headers={
+                    "content-type": "application/pdf",
+                    "content-disposition": 'attachment; filename="r.pdf"',
+                },
+            )
+        return httpx.Response(500, json={"detail": "unexpected"})
+
+    mock_transport(handler)
+    data = await _call_tool("export_report", {"report_id": 5, "format": "pdf"})
+    assert data["filename"] == "r.pdf"
+    assert data["size_bytes"] == len(b"%PDF-1.4 retry-payload")
+    assert login_counter["n"] == 2
+    assert export_counter["n"] == 2
+
+
 async def test_export_report_rejects_bad_format(mock_transport) -> None:
     mock_transport(lambda req: json_response({}))
     mcp = get_stdio_mcp()
