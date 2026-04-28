@@ -46,9 +46,12 @@ def _allowed_client_redirect_uris() -> list[str]:
     raw = os.getenv("MCP_ALLOWED_CLIENT_REDIRECT_URIS", "").strip()
     if not raw:
         return list(_DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS)
-    return [uri.strip() for uri in raw.split(",") if uri.strip()]
 
+    allowed_uris = [uri.strip() for uri in raw.split(",") if uri.strip()]
+    if not allowed_uris:
+        return list(_DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS)
 
+    return allowed_uris
 def get_header_mcp() -> FastMCP:
     """HTTP mode — FastMCP is the sole auth layer (mPass is NOT in front).
 

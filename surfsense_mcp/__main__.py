@@ -99,7 +99,11 @@ async def healthz(_request: Request) -> JSONResponse:
 
 
 def resolve_cors_origins() -> list[str]:
-    """Parse MCP_ALLOWED_ORIGINS; fall back to ['*'] outside production."""
+    """Parse MCP_ALLOWED_ORIGINS; fall back to ['*'] when unset or invalid.
+
+    In production this function still defaults to ['*'], but emits a warning
+    so operators can tighten CORS by setting explicit origins.
+    """
     raw = os.getenv("MCP_ALLOWED_ORIGINS", "").strip()
     env = os.getenv("MCP_ENV", "development").strip().lower()
 
