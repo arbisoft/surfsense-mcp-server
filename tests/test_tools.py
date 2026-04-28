@@ -586,6 +586,36 @@ async def test_export_report(mock_transport) -> None:
     assert req.url.params["format"] == "pdf"
 
 
+async def test_export_report_streams_size_from_chunks_without_content_length(mock_transport) -> None:
+    """When the upstream omits Content-Length we must count bytes on the
+    wire rather than buffering the full export in memory."""
+    payload = b"X" * 4096
+
+    async def astream() -> Any:
+        yield payload[:1024]
+        yield payload[1024:3072]
+        yield payload[3072:]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # httpx.Response auto-derives Content-Length from `content=bytes`.
+        # An async iterator leaves Content-Length unset, exercising the
+        # chunk-counting fallback path.
+        return httpx.Response(
+            200,
+            content=astream(),
+            headers={
+                "content-type": "application/pdf",
+                "content-disposition": 'attachment; filename="big.pdf"',
+            },
+        )
+
+    mock_transport(handler)
+    data = await _call_tool("export_report", {"report_id": 9, "format": "pdf"})
+    assert data["size_bytes"] == len(payload)
+    assert data["filename"] == "big.pdf"
+    assert data["content_type"] == "application/pdf"
+
+
 async def test_export_report_rejects_bad_format(mock_transport) -> None:
     mock_transport(lambda req: json_response({}))
     mcp = get_stdio_mcp()
