@@ -18,6 +18,7 @@ tool calls don't double-issue logins.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from threading import Lock
@@ -33,6 +34,7 @@ _DEFAULT_TOKEN_TTL_SECONDS = 3300
 _cached_password_token: str | None = None
 _cached_password_token_expires_at: float = 0.0
 _password_token_lock = Lock()
+_password_login_lock = asyncio.Lock()
 
 
 def _base_url() -> str:
@@ -129,9 +131,17 @@ async def resolve_jwt() -> str:
         cached = _get_cached_token()
         if cached:
             return cached
-        token = await _login_with_password()
-        _store_cached_token(token)
-        return token
+        # Serialize concurrent logins so an empty cache + N parallel tool
+        # calls produce one POST /auth/jwt/login, not N. Re-check inside the
+        # lock — by the time we acquire it, an earlier caller may have
+        # already populated the cache.
+        async with _password_login_lock:
+            cached = _get_cached_token()
+            if cached:
+                return cached
+            token = await _login_with_password()
+            _store_cached_token(token)
+            return token
 
     raise RuntimeError(
         "No SurfSense credential available. Set SURFSENSE_JWT, "

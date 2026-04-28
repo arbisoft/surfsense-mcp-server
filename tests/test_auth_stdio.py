@@ -8,6 +8,8 @@ tests so a regression here can't hide behind a successful integration test.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -105,6 +107,34 @@ async def test_resolve_jwt_uses_cached_token_within_ttl(monkeypatch: pytest.Monk
 
     assert first == second == "fresh-token"
     assert len(recorded) == 1, "Second resolve should hit the cache, not /auth/jwt/login"
+
+
+async def test_resolve_jwt_serializes_concurrent_logins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """N concurrent resolve_jwt() calls with an empty cache must produce
+    exactly one POST /auth/jwt/login — the lock guards the
+    check→login→store sequence, not just the cache mutations."""
+    monkeypatch.setenv("SURFSENSE_EMAIL", "user@example.com")
+    monkeypatch.setenv("SURFSENSE_PASSWORD", "hunter2")
+
+    gate = asyncio.Event()
+    login_calls = 0
+
+    async def slow_login() -> str:
+        nonlocal login_calls
+        login_calls += 1
+        await gate.wait()
+        return "fresh-token"
+
+    monkeypatch.setattr(stdio, "_login_with_password", slow_login)
+
+    tasks = [asyncio.create_task(stdio.resolve_jwt()) for _ in range(10)]
+    # Let every task reach the lock before the first login resolves.
+    await asyncio.sleep(0)
+    gate.set()
+    results = await asyncio.gather(*tasks)
+
+    assert results == ["fresh-token"] * 10
+    assert login_calls == 1
 
 
 async def test_invalidate_cache_forces_relogin(monkeypatch: pytest.MonkeyPatch) -> None:
