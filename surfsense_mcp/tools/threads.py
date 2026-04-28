@@ -183,7 +183,11 @@ def _extract_text_delta(line: str) -> str | None:
     """
     if not line:
         return None
-    if line.startswith("event:"):
+    # SSE framing: only ``data:`` carries payload. ``event:``/``id:``/``retry:``
+    # are metadata; a line starting with ``:`` is a comment (commonly used for
+    # keepalive pings). Skipping these prevents raw framing like ``id: 3``
+    # from falling through JSON parsing and getting appended as response text.
+    if line.startswith((":", "event:", "id:", "retry:")):
         return None
 
     if line.startswith("data:"):

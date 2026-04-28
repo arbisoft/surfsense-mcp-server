@@ -444,6 +444,36 @@ async def test_query_surfsense_streams_and_creates_thread(mock_transport) -> Non
     assert body["search_space_id"] == 3
 
 
+async def test_query_surfsense_skips_sse_metadata_lines(mock_transport) -> None:
+    """SSE streams interleave id:/retry:/: comment lines with data: frames.
+    Those are framing, not payload — they must not leak into the response."""
+    sse_body = (
+        ": keep-alive ping\n\n"
+        "retry: 5000\n\n"
+        "id: 3\n"
+        'data: {"type":"text-delta","id":"t1","delta":"Hello "}\n\n'
+        "id: 4\n"
+        'data: {"type":"text-delta","id":"t1","delta":"world"}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/v1/new_chat":
+            return httpx.Response(
+                200,
+                content=sse_body.encode("utf-8"),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(500, json={"detail": "should not be called"})
+
+    mock_transport(handler)
+    data = await _call_tool(
+        "query_surfsense",
+        {"user_query": "hi", "search_space_id": 3, "thread_id": 42},
+    )
+    assert data["response"] == "Hello world"
+
+
 async def test_query_surfsense_uses_existing_thread(mock_transport) -> None:
     sse_body = 'data: {"type":"text-delta","id":"1","delta":"ok"}\n\ndata: [DONE]\n\n'
 
