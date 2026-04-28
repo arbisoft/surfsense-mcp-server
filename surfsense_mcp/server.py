@@ -81,7 +81,12 @@ def get_header_mcp() -> FastMCP:
 
 
 def get_stdio_mcp() -> FastMCP:
-    """Stdio mode — uses SURFSENSE_JWT env var for upstream auth."""
+    """Stdio mode — supports two upstream auth paths.
+
+    It can use the ``SURFSENSE_JWT`` environment variable for upstream auth,
+    or fall back to the email/password login flow provided by
+    ``surfsense_mcp.auth.stdio``.
+    """
     mcp = FastMCP("SurfSense MCP Server (stdio)", icons=[ICON])
     mcp.add_middleware(StructuredLoggingMiddleware(include_payloads=True))
     register_tools(mcp)

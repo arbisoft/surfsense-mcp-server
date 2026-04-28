@@ -33,7 +33,7 @@ surfsense-mcp-server/
 │       └── logs.py                        # get
 └── tests/
     ├── conftest.py                        # mock_transport fixture, FAKE_JWT, json_response
-    └── test_tools.py                      # 7 smoke tests — URL, query string, auth header, 401
+    └── test_tools.py                      # coverage for multiple tool surfaces and auth behavior
 ```
 
 ## Dev commands
