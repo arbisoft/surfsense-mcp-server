@@ -136,6 +136,42 @@ def test_get_header_mcp_wires_aws_cognito_provider(monkeypatch):
     ]
 
 
+def test_get_header_mcp_forwards_client_storage(monkeypatch):
+    """``client_storage`` from ``build_oauth_storage()`` reaches AWSCognitoProvider.
+
+    Without forwarding, the provider keeps its default file store and refresh
+    tokens vanish on container recreation. We patch the constructor and assert
+    on the kwarg rather than wiring up real Valkey here.
+    """
+    from fastmcp.server.auth.providers import aws as aws_module
+
+    from surfsense_mcp import server as server_module
+    from surfsense_mcp.auth import storage as storage_module
+
+    monkeypatch.setenv("COGNITO_USER_POOL_ID", "ap-southeast-1_TEST123")
+    monkeypatch.setenv("COGNITO_AWS_REGION", "ap-southeast-1")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.setenv("MCP_BASE_URL", "https://mcp.test.example.com")
+
+    sentinel = object()
+    monkeypatch.setattr(storage_module, "build_oauth_storage", lambda: sentinel)
+
+    captured: dict[str, object] = {}
+
+    def fake_init(self, **kwargs):
+        captured.update(kwargs)
+        # Stop here — we don't need a working provider, just the kwargs.
+        raise RuntimeError("stop after constructor capture")
+
+    monkeypatch.setattr(aws_module.AWSCognitoProvider, "__init__", fake_init)
+
+    with pytest.raises(RuntimeError, match="stop after constructor capture"):
+        server_module.get_header_mcp()
+
+    assert captured.get("client_storage") is sentinel
+
+
 async def test_http_request_raises_when_username_missing(monkeypatch):
     """An AccessToken with no username claim is a hard error, not a silent fallback."""
     monkeypatch.setenv("SURFSENSE_BASE_URL", "http://surfsense-backend:8000")

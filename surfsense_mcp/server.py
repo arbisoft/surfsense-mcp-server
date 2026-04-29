@@ -52,6 +52,8 @@ def _allowed_client_redirect_uris() -> list[str]:
         return list(_DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS)
 
     return allowed_uris
+
+
 def get_header_mcp() -> FastMCP:
     """HTTP mode — FastMCP is the sole auth layer (mPass is NOT in front).
 
@@ -70,6 +72,8 @@ def get_header_mcp() -> FastMCP:
     """
     from fastmcp.server.auth.providers.aws import AWSCognitoProvider
 
+    from surfsense_mcp.auth.storage import build_oauth_storage
+
     provider = AWSCognitoProvider(
         user_pool_id=os.environ["COGNITO_USER_POOL_ID"],
         aws_region=os.environ["COGNITO_AWS_REGION"],
@@ -85,6 +89,8 @@ def get_header_mcp() -> FastMCP:
         # token exchange. MCP clients still send `resource` to FastMCP; we just
         # don't pass it through to the upstream IdP.
         forward_resource=False,
+        # None → FastMCP keeps its encrypted-file default. See auth/storage.py.
+        client_storage=build_oauth_storage(),
     )
     mcp = FastMCP(
         "SurfSense MCP Server (http)",

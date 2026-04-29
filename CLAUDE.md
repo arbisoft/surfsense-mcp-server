@@ -22,7 +22,8 @@ surfsense-mcp-server/
 │   ├── auth/
 │   │   ├── __init__.py                    # build_auth_headers() dispatcher + retry-gate
 │   │   ├── stdio.py                       # SURFSENSE_JWT / password fallback / cache
-│   │   └── http.py                        # FastMCP AccessToken → X-Auth-Request-User
+│   │   ├── http.py                        # FastMCP AccessToken → X-Auth-Request-User
+│   │   └── storage.py                     # MCP_OAUTH_STORAGE_URL → ValkeyStore + Fernet
 │   └── tools/
 │       ├── __init__.py                    # register_tools(mcp) — calls all per-module register fns
 │       ├── search_spaces.py               # list / get / create / update / delete
@@ -111,6 +112,19 @@ No manual Bearer paste and no Cognito client config needed on the MCP client sid
 **One-time AWS Console prerequisite:** on the existing Cognito app client (`OIDC_CLIENT_ID`), add `${MCP_BASE_URL}/auth/callback` to the allowed callback URLs and ensure `authorization_code` is in the enabled grant types. No new app client, no new secret.
 
 **MCP Inspector for local dev:** `npx @modelcontextprotocol/inspector`, transport "Streamable HTTP", URL `https://foss-research-mcp.local.moneta.dev/mcp` — Inspector follows the same discovery + OAuth flow.
+
+### HTTP-mode storage
+
+`AWSCognitoProvider` (via `OAuthProxy`) keeps six collections of OAuth state — DCR client registrations, in-flight authorize transactions, authorization codes, upstream Cognito access/refresh tokens, JTI mappings, and refresh-token metadata. Two backends:
+
+- **Default — encrypted file tree** under `~/.local/share/fastmcp/oauth-proxy/<fingerprint>/` inside the container. Survives `docker compose restart`, but `docker compose down && up` recreates the container's writable layer and wipes everything → every MCP client re-OAuths on next call. Single-replica only.
+- **Production — Valkey/Redis** (`MCP_OAUTH_STORAGE_URL=redis://valkey:6379/<db>`). `auth/storage.py:build_oauth_storage()` parses the URL, constructs a `ValkeyStore`, and wraps it in `FernetEncryptionWrapper` keyed off `OIDC_CLIENT_SECRET` (same HKDF derivation FastMCP uses for the file store, so on-disk RDB never carries plaintext). State survives container recreation; multi-replica works as long as all replicas point at the same instance.
+
+In the Moneta devstack the compose file always sets `MCP_OAUTH_STORAGE_URL=redis://valkey:6379/11` so the backend is Valkey by default. `__main__.py:warn_if_storage_missing_in_production()` logs a warning when `MCP_ENV=production` and the URL is unset; we don't hard-fail because evaluation/local runs of the image should still come up.
+
+**Eviction caveat.** Devstack Valkey runs `--maxmemory 512mb --maxmemory-policy allkeys-lru` (server-wide). Under memory pressure refresh tokens *can* be evicted regardless of TTL. At current load this is theoretical, but for high-traffic prod either bump `--maxmemory` or switch the policy to `volatile-lru`. Per-DB eviction policies are not a feature of Valkey/Redis; the change affects every consumer on the instance.
+
+**Key shape.** Stored keys appear as `<collection>::<key>` (e.g. `mcp-authorization-codes::1tvOoh8...`). The `::` is `py-key-value-aio`'s `DEFAULT_COMPOUND_SEPARATOR` — single `:` was avoided because Redis-shaped data routinely uses it for in-key namespacing (`session:abc`, `user:42:profile`).
 
 ### Tool conventions
 

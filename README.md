@@ -230,8 +230,11 @@ The fastest way to verify a fresh deploy. Inspector is `npx`-installed, runs loc
 | `COGNITO_USER_POOL_ID` / `COGNITO_AWS_REGION` | yes | http | Cognito pool to validate Bearer tokens against. |
 | `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | yes | http | Cognito app client used for the OAuth proxy. Reuses the existing oauth2-proxy client in the Moneta devstack. |
 | `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | optional | http | Comma-separated allow-list for DCR-registered redirect URIs. Empty/unset → localhost-only defaults (covers Claude Desktop, Cursor, MCP Inspector). Add server-side MCP clients explicitly. |
-| `MCP_ENV` | optional | http | `production` triggers a warning when `MCP_ALLOWED_ORIGINS` is unset/`*`. Default `development`. |
+| `MCP_OAUTH_STORAGE_URL` | optional | http | Valkey/Redis URL for OAuth state (`redis://valkey:6379/11`). Unset → encrypted file store on the container filesystem; tokens are wiped on container recreation and there's no path to multi-replica. Set this in any deployment that needs to survive `docker compose down && up` or scale beyond one replica. State at rest is Fernet-encrypted using a key derived from `OIDC_CLIENT_SECRET`. |
+| `MCP_ENV` | optional | http | `production` triggers warnings when `MCP_ALLOWED_ORIGINS` is unset/`*` or `MCP_OAUTH_STORAGE_URL` is unset. Default `development`. |
 | `MCP_ALLOWED_ORIGINS` | optional | http | Comma-separated CORS origins. Default `*`. |
+| `MCP_LOG_LEVEL` | optional | both | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` (case-insensitive). Unset → derived from `MCP_ENV`: `production` → `INFO`, anything else → `DEBUG`. Bogus values warn at startup and fall through to the env-derived default. |
+| `MCP_LOG_PAYLOADS` | optional | both | When truthy (`1`/`true`/`yes`/`on`), the structured-logging middleware includes tool request/response payloads. Default off — payloads can include chat prompts, document bodies, and base64 uploads. Useful for short debugging windows only. |
 
 ## Deployment in `foss-server-bundle-devstack`
 
@@ -239,6 +242,7 @@ The MCP server runs as a sidecar on its own subdomain (`https://<prefix>research
 
 - Auto-derives `COGNITO_USER_POOL_ID` and `COGNITO_AWS_REGION` from `OIDC_BASE_URI` (see `scripts/derive-oidc-endpoints.sh`).
 - Wires `SURFSENSE_BASE_URL=http://surfsense-backend:8000` so the MCP → backend call stays on the docker network.
+- Wires `MCP_OAUTH_STORAGE_URL=redis://valkey:6379/11` so OAuth state lives in the shared Valkey on a dedicated DB rather than the container filesystem — refresh tokens survive `docker compose down && up`.
 - Removes `mpass-auth@docker` from this service's Traefik router (FastMCP is the sole auth layer); keeps `strip-auth-headers@docker` so external clients can't forge `X-Auth-Request-*`.
 
 The only manual step beyond `make dev.up.surfsense` is the one-time AWS Console task described under [How auth works](#how-auth-works).
