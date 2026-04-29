@@ -141,12 +141,15 @@ def test_get_header_mcp_forwards_client_storage(monkeypatch):
 
     Without forwarding, the provider keeps its default file store and refresh
     tokens vanish on container recreation. We patch the constructor and assert
-    on the kwarg rather than wiring up real Valkey here.
+    on the kwarg rather than wiring up real Valkey here. The storage helper now
+    lives in the shared ``moneta_mcp_auth`` lib, but ``cognito.build_cognito_provider``
+    re-binds it as a module-level import — patching that module's reference is
+    what reaches the call inside ``get_header_mcp``.
     """
     from fastmcp.server.auth.providers import aws as aws_module
+    from moneta_mcp_auth import cognito as cognito_module
 
     from surfsense_mcp import server as server_module
-    from surfsense_mcp.auth import storage as storage_module
 
     monkeypatch.setenv("COGNITO_USER_POOL_ID", "ap-southeast-1_TEST123")
     monkeypatch.setenv("COGNITO_AWS_REGION", "ap-southeast-1")
@@ -155,7 +158,7 @@ def test_get_header_mcp_forwards_client_storage(monkeypatch):
     monkeypatch.setenv("MCP_BASE_URL", "https://mcp.test.example.com")
 
     sentinel = object()
-    monkeypatch.setattr(storage_module, "build_oauth_storage", lambda: sentinel)
+    monkeypatch.setattr(cognito_module, "build_oauth_storage", lambda: sentinel)
 
     captured: dict[str, object] = {}
 
@@ -194,7 +197,7 @@ async def test_http_request_raises_when_username_missing(monkeypatch):
     )
     reset = _set_request_token(token_without_username)
     try:
-        with pytest.raises(RuntimeError, match="username claim missing"):
+        with pytest.raises(RuntimeError, match="'username' claim missing"):
             await client_module.authed_request("GET", "/api/v1/searchspaces")
     finally:
         _reset_request_token(reset)

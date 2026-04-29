@@ -9,13 +9,16 @@ Two transports, two strategies:
   ``username`` claim. The Cognito Bearer is *not* forwarded.
 
 The dispatcher in :func:`build_auth_headers` picks based on whether a FastMCP
-HTTP request scope is active. See :mod:`surfsense_mcp.auth.stdio` and
-:mod:`surfsense_mcp.auth.http` for the per-mode internals.
+HTTP request scope is active. Generic Cognito-side wiring (claim extraction,
+``AccessToken`` access) lives in the shared ``moneta_mcp_auth`` lib; the
+SurfSense-specific stdio JWT/password fallback stays in
+:mod:`surfsense_mcp.auth.stdio`.
 """
 
 from __future__ import annotations
 
-from surfsense_mcp.auth import http as _http
+from moneta_mcp_auth import extract_header_from_token, request_token
+
 from surfsense_mcp.auth import stdio as _stdio
 
 __all__ = [
@@ -27,9 +30,9 @@ __all__ = [
 
 async def build_auth_headers() -> dict[str, str]:
     """Return the auth header(s) to attach to the next SurfSense backend call."""
-    token = _http.request_token()
+    token = request_token()
     if token is not None:
-        return _http.username_header(token)
+        return extract_header_from_token(token)
     return {"Authorization": f"Bearer {await _stdio.resolve_jwt()}"}
 
 
@@ -42,7 +45,7 @@ def auth_came_from_password() -> bool:
     one. Stdio with password fallback: retry — the cached token may have
     expired server-side before our local TTL.
     """
-    if _http.request_token() is not None:
+    if request_token() is not None:
         return False
     return _stdio.is_password_in_use()
 

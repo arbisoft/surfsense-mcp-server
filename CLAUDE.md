@@ -16,14 +16,12 @@ surfsense-mcp-server/
 ├── .env.example
 ├── surfsense_mcp/
 │   ├── __init__.py
-│   ├── __main__.py                        # CLI entry: ServerMode enum (stdio|http), JSON logging
+│   ├── __main__.py                        # CLI entry: ServerMode + transport wiring (delegates to moneta-mcp-auth)
 │   ├── server.py                          # get_stdio_mcp() / get_header_mcp() factories
 │   ├── client.py                          # httpx wiring + retry; no auth (see auth/)
 │   ├── auth/
 │   │   ├── __init__.py                    # build_auth_headers() dispatcher + retry-gate
-│   │   ├── stdio.py                       # SURFSENSE_JWT / password fallback / cache
-│   │   ├── http.py                        # FastMCP AccessToken → X-Auth-Request-User
-│   │   └── storage.py                     # MCP_OAUTH_STORAGE_URL → ValkeyStore + Fernet
+│   │   └── stdio.py                       # SURFSENSE_JWT / password fallback / cache
 │   └── tools/
 │       ├── __init__.py                    # register_tools(mcp) — calls all per-module register fns
 │       ├── search_spaces.py               # list / get / create / update / delete
@@ -37,22 +35,52 @@ surfsense-mcp-server/
     └── test_tools.py                      # coverage for multiple tool surfaces and auth behavior
 ```
 
+## Shared lib (moneta-mcp-auth)
+
+This package depends on **`moneta-mcp-auth`**, a sibling Python package that
+lives at `../moneta-mcp-auth/`. All Cognito SSO wiring (provider construction,
+OAuth state storage, DCR shim, claim → `X-Auth-Request-User` extraction,
+Starlette + CORS + `/healthz` boilerplate, JSON logging, port + env helpers)
+lives in `moneta-mcp-auth` and is imported from `moneta_mcp_auth`. Surfsense-
+specific code: `surfsense_mcp.client` (httpx wiring + 401-retry hook),
+`surfsense_mcp.auth.stdio` (password fallback), `surfsense_mcp.auth.__init__`
+(the dispatcher between `extract_header_from_token` and the surfsense JWT
+path), tools.
+
+`pyproject.toml` declares `moneta-mcp-auth>=0.1.0,<0.2.0` as a normal dep
+plus a dev-only override:
+
+```toml
+[tool.uv.sources]
+moneta-mcp-auth = { path = "../moneta-mcp-auth", editable = true }
+```
+
+The override resolves to the sibling checkout during local dev + CI so
+changes propagate without re-publishing. `[tool.uv.sources]` is dev-only
+metadata and is stripped from the built sdist/wheel — published consumers
+of `surfsense-mcp-server` pull `moneta-mcp-auth` from PyPI at the version
+pinned above.
+
+There is **no monorepo / no uv workspace**. Each package has its own
+`uv.lock` and venv. The two are coordinated only by the path dep above and
+by the published-version pin.
+
 ## Dev commands
 
 ```bash
-# Install
+# Install (sibling moneta-mcp-auth checkout must exist at ../moneta-mcp-auth)
 cd surfsense-mcp-server
-uv venv && uv pip install -e ".[dev]"
+uv sync --all-extras
 
 # Tests (no live backend needed — httpx is mocked)
-pytest
+uv run pytest
 
 # Lint / format
 ruff check surfsense_mcp/
 ruff format surfsense_mcp/
 
-# Upgrade fastmcp to latest v3
-uv sync --extra dev --upgrade-package fastmcp
+# Upgrade fastmcp to latest v3 (locally)
+uv sync --upgrade-package fastmcp
 
 # Run stdio locally (JWT paste)
 SURFSENSE_BASE_URL=http://localhost:8000 SURFSENSE_JWT=<jwt> python -m surfsense_mcp stdio
@@ -92,9 +120,9 @@ SurfSense issues short-lived JWTs from `fastapi-users` (no API-key concept). The
 
 - **stdio (primary):** JWT from `SURFSENSE_JWT` env var — user pastes a fresh one when it expires. No refresh.
 - **stdio (optional fallback):** if `SURFSENSE_JWT` is unset and `SURFSENSE_EMAIL` + `SURFSENSE_PASSWORD` are set, the client calls `POST /auth/jwt/login`, caches the token for `TOKEN_TTL` seconds (default 3300 = 55 min), and auto-re-authenticates once on 401. Intended for CI / long-running stdio sessions.
-- **http:** `AWSCognitoProvider` validates the inbound Cognito Bearer against the pool's JWKS and exposes the filtered claims via `get_access_token()`. `auth/http.py:username_header()` reads `claims["username"]` and the dispatcher forwards it as `X-Auth-Request-User` to SurfSense — the backend's `ProxyAuthMiddleware` does the rest. The Cognito Bearer itself is **not** forwarded; the internal-network call to SurfSense carries only the header. No SurfSense JWT minting, no caching.
+- **http:** `AWSCognitoProvider` validates the inbound Cognito Bearer against the pool's JWKS and exposes the filtered claims via `get_access_token()`. The shared lib's `moneta_mcp_auth.extract_header_from_token()` reads `claims["username"]` and the dispatcher forwards it as `X-Auth-Request-User` to SurfSense — the backend's `ProxyAuthMiddleware` does the rest. The Cognito Bearer itself is **not** forwarded; the internal-network call to SurfSense carries only the header. No SurfSense JWT minting, no caching.
 
-`auth/__init__.py:build_auth_headers()` is the dispatcher: if an HTTP request token is in scope (`auth/http.py:request_token()` returns non-None), it returns `{X-Auth-Request-User: <username>}`; otherwise it returns `{Authorization: Bearer <surfsense-jwt>}` from `auth/stdio.py:resolve_jwt()`. The 401-retry-once path (gated by `auth_came_from_password()`) fires only in stdio password mode — HTTP-mode 401s are surfaced unchanged because they indicate a real provisioning failure, not a stale token.
+`auth/__init__.py:build_auth_headers()` is the dispatcher: if an HTTP request token is in scope (`moneta_mcp_auth.request_token()` returns non-None), it returns `{X-Auth-Request-User: <username>}`; otherwise it returns `{Authorization: Bearer <surfsense-jwt>}` from `auth/stdio.py:resolve_jwt()`. The 401-retry-once path (gated by `auth_came_from_password()`) fires only in stdio password mode — HTTP-mode 401s are surfaced unchanged because they indicate a real provisioning failure, not a stale token.
 
 ### Connecting Claude Desktop / Cursor (HTTP mode)
 
@@ -118,7 +146,7 @@ No manual Bearer paste and no Cognito client config needed on the MCP client sid
 `AWSCognitoProvider` (via `OAuthProxy`) keeps six collections of OAuth state — DCR client registrations, in-flight authorize transactions, authorization codes, upstream Cognito access/refresh tokens, JTI mappings, and refresh-token metadata. Two backends:
 
 - **Default — encrypted file tree** under `~/.local/share/fastmcp/oauth-proxy/<fingerprint>/` inside the container. Survives `docker compose restart`, but `docker compose down && up` recreates the container's writable layer and wipes everything → every MCP client re-OAuths on next call. Single-replica only.
-- **Production — Valkey/Redis** (`MCP_OAUTH_STORAGE_URL=redis://valkey:6379/<db>`). `auth/storage.py:build_oauth_storage()` parses the URL, constructs a `ValkeyStore`, and wraps it in `FernetEncryptionWrapper` keyed off `OIDC_CLIENT_SECRET` (same HKDF derivation FastMCP uses for the file store, so on-disk RDB never carries plaintext). State survives container recreation; multi-replica works as long as all replicas point at the same instance.
+- **Production — Valkey/Redis** (`MCP_OAUTH_STORAGE_URL=redis://valkey:6379/<db>`). The shared lib's `moneta_mcp_auth.build_oauth_storage()` parses the URL, constructs a `ValkeyStore`, and wraps it in `FernetEncryptionWrapper` keyed off `OIDC_CLIENT_SECRET` (same HKDF derivation FastMCP uses for the file store, so on-disk RDB never carries plaintext). State survives container recreation; multi-replica works as long as all replicas point at the same instance.
 
 In the Moneta devstack the compose file always sets `MCP_OAUTH_STORAGE_URL=redis://valkey:6379/11` so the backend is Valkey by default. `__main__.py:warn_if_storage_missing_in_production()` logs a warning when `MCP_ENV=production` and the URL is unset; we don't hard-fail because evaluation/local runs of the image should still come up.
 
@@ -172,11 +200,11 @@ Both enforce a 500 MB per-file ceiling that mirrors `surfsense_backend/app/route
 
 **Why base64 at the MCP boundary, not multipart.** MCP is JSON-RPC 2.0 — every tool argument must be JSON-serializable. FastMCP v3 has no input-side binary type: `fastmcp/utilities/types.py:238-276` ships only output helpers (`Image` / `Audio` / `File`), and `fastmcp/tools/function_parsing.py:43-50` actively replaces `bytes` in tool input schemas with `_UnserializableType`. Base64 inside a JSON string is the only available channel for inline bytes.
 
-**Why we don't add a sidecar `POST /upload` route on the HTTP app.** Mechanically easy — drop a `Route("/upload", ...)` next to `/healthz` in `surfsense_mcp/__main__.py:117-148` (~80 LOC + a JWKS-validating dependency, since FastMCP's `get_access_token()` only resolves inside a tool-call scope and can't be reused from a Starlette route). But it does not help the primary use case. Claude Desktop / Cursor / Windsurf only emit `tools/call`; they will not autonomously `PUT` chat-attached bytes to a non-MCP URL — tool *results* are returned to the model as text/structured content, not as instructions the host acts on. The endpoint would only benefit programmatic / curl-style callers, which didn't justify the duplicate auth surface or a second supported transport for uploads.
+**Why we don't add a sidecar `POST /upload` route on the HTTP app.** Mechanically easy — pass an extra route to `moneta_mcp_auth.build_http_app(..., extra_routes=[Route("/upload", ...)])` (~80 LOC + a JWKS-validating dependency, since FastMCP's `get_access_token()` only resolves inside a tool-call scope and can't be reused from a Starlette route). But it does not help the primary use case. Claude Desktop / Cursor / Windsurf only emit `tools/call`; they will not autonomously `PUT` chat-attached bytes to a non-MCP URL — tool *results* are returned to the model as text/structured content, not as instructions the host acts on. The endpoint would only benefit programmatic / curl-style callers, which didn't justify the duplicate auth surface or a second supported transport for uploads.
 
 **What would change this decision.** Two concrete signals to watch: (a) the MCP spec adds a binary input frame or sanctions out-of-band upload triggers in tool results; (b) Claude Desktop / Cursor ship a feature that lets a tool result instruct the host to upload a referenced attachment to a URL. Until then, base64 stays.
 
-**Do-not-change pointers.** Do not add a `Route("/upload", ...)` in `__main__.py` unless one of the signals above lands. Do not try to switch the tool inputs to a `bytes`-typed parameter — `function_parsing.py:43-50` will reject it. The existing 500 MB guard in `surfsense_mcp/tools/documents.py` is the correct upper bound and matches the backend; lowering it requires a backend-side change to match.
+**Do-not-change pointers.** Do not pass a `Route("/upload", ...)` to `build_http_app(extra_routes=...)` unless one of the signals above lands. Do not try to switch the tool inputs to a `bytes`-typed parameter — `function_parsing.py:43-50` will reject it. The existing 500 MB guard in `surfsense_mcp/tools/documents.py` is the correct upper bound and matches the backend; lowering it requires a backend-side change to match.
 
 ## Relevant SurfSense backend files
 
@@ -195,6 +223,70 @@ When adding tools, check these backend files to confirm route paths and query pa
 > `sort_column_map` in `documents_routes.py` only accepts `"created_at"`, `"title"`, `"document_type"` — `"updated_at"` is not a valid sort key.
 >
 > Confirm each route's existence and exact path before implementing a tool — DocuMentor (the reference port source) targets a different SurfSense fork and some paths may not match this fork. If a route is missing, drop the tool (no backend additions).
+
+## Docker build
+
+Two Dockerfiles cover two distinct flows:
+
+### Production — `Dockerfile`
+
+Multi-stage. Builder produces a wheel from local source; runtime
+`pip install`s the wheel, which resolves `moneta-mcp-auth` from PyPI per
+the version pin. **No `--build-context`, no buildx required.**
+
+```bash
+# From surfsense-mcp-server/
+docker build -t surfsense-mcp:dev .
+```
+
+This is what CI runs (`.github/workflows/build-image.yml`) and what the
+devstack's `make dev.build.surfsense.mcp` invokes.
+
+`pip` is intentional in the runtime stage — `pip` ignores
+`[tool.uv.sources]`, `uv pip` honors it. The lib must already be on PyPI
+for this build to succeed.
+
+### Cross-package iteration — `Dockerfile.dev`
+
+Use when you're editing both `surfsense-mcp-server` and `moneta-mcp-auth`
+at the same time and want the lib changes baked into a devstack image
+without publishing to PyPI. The builder produces wheels for *both*
+packages; the runtime installs the local lib wheel first so the app's
+resolver picks it instead of going to PyPI.
+
+```bash
+# From surfsense-mcp-server/, with moneta-mcp-auth checked out at ../moneta-mcp-auth
+docker buildx build \
+    --build-context monetaauth=../moneta-mcp-auth \
+    -f Dockerfile.dev \
+    -t ghcr.io/pressingly/surfsense-mcp:dev-local .
+```
+
+Or via the devstack: `make dev.clone.lib && make dev.build.surfsense.mcp.local`.
+
+### Why two files
+
+The single-Dockerfile-with-build-arg pattern requires `RUN` blocks to
+branch on `${ARG}`, which makes layer caching unpredictable and trips up
+`docker build`'s static analysis. Two narrow files are clearer than one
+file with a flag, especially when one is invoked by CI and the other by
+human developers.
+
+### `[tool.uv.sources]` is dev-only
+
+`pyproject.toml` declares:
+
+```toml
+[tool.uv.sources]
+moneta-mcp-auth = { path = "../moneta-mcp-auth", editable = true }
+```
+
+`uv` honors this for `uv sync`/`uv run` (sibling lib for fast dev
+iteration). `pip` ignores it. `python -m build` does not serialize it
+into the wheel METADATA. So the production Dockerfile's wheel gets a
+clean `Requires-Dist: moneta-mcp-auth>=0.1.0,<0.2.0` and `pip install`
+pulls from PyPI normally. The Dockerfile builder greps the wheel
+METADATA for path-style requirements and refuses to ship if any leak.
 
 ## Test fixtures
 

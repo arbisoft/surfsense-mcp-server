@@ -11,16 +11,27 @@ authors = [
 keywords = ["mcp", "surfsense", "fastmcp", "ai", "research"]
 
 dependencies = [
+    "moneta-mcp-auth>=0.1.0,<0.2.0",
     "fastmcp>=3.2.0,<4.0.0",
     "mcp>=1.26.0",
     "httpx>=0.27.0",
     "starlette>=0.37.0",
     "uvicorn>=0.30.0",
     # Adds the Valkey GLIDE backend so HTTP-mode OAuth state can be stored
-    # outside the container filesystem (see surfsense_mcp/auth/storage.py).
-    # Pin matches FastMCP's transitive py-key-value-aio constraint.
+    # outside the container filesystem. The shared moneta-mcp-auth lib also
+    # depends on this with the same range; declared here too so the dep is
+    # visible at this package's surface and a future drop of the lib (or the
+    # password-fallback flow that lives in surfsense_mcp/auth/stdio.py) won't
+    # silently lose Valkey support.
     "py-key-value-aio[valkey]>=0.4.4,<0.5.0",
 ]
+
+[tool.uv.sources]
+# Dev-only: prefer the sibling checkout during local development + CI so
+# changes in moneta-mcp-auth are picked up without a re-publish. Stripped
+# from the built sdist/wheel — published consumers pull moneta-mcp-auth
+# from PyPI at the version pinned above. Path is relative to this file.
+moneta-mcp-auth = { path = "../moneta-mcp-auth", editable = true }
 
 [project.optional-dependencies]
 dev = [

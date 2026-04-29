@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync deps (ignore [tool.uv.sources])
+        # The pyproject.toml's [tool.uv.sources] points moneta-mcp-auth at a
+        # sibling path that doesn't exist in CI. --no-sources tells uv to
+        # ignore the override and resolve from PyPI per the version pin.
+        run: uv sync --no-sources --all-extras --python ${{ matrix.python-version }}
+
+      - name: Lint (ruff check)
+        run: uv run ruff check surfsense_mcp tests
+
+      - name: Format check (ruff format --check)
+        run: uv run ruff format --check surfsense_mcp tests
+
+      - name: Run tests
+        run: uv run pytest -q
