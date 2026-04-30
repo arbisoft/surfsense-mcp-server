@@ -4,7 +4,7 @@ Two layers under test:
 
 - :func:`parse_storage_url` — pure-Python URL parsing. No I/O, no GLIDE.
 - :func:`build_oauth_storage` — env-var dispatch + Fernet wrap. The Valkey
-  GLIDE client is imported lazily so the unset-env and missing-secret
+  GLIDE client is imported lazily so the unset-env and missing-key-material
   branches don't require it.
 """
 
@@ -15,6 +15,7 @@ import importlib
 import pytest
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 
+from surfsense_mcp.auth import storage as storage_module
 from surfsense_mcp.auth.storage import (
     ValkeyConfig,
     build_oauth_storage,
@@ -86,17 +87,23 @@ def test_returns_none_when_url_blank(monkeypatch):
     assert build_oauth_storage() is None
 
 
-def test_raises_when_oidc_client_secret_missing(monkeypatch):
-    """Without OIDC_CLIENT_SECRET the Fernet key cannot be derived."""
+def test_raises_when_no_key_material_set(monkeypatch):
+    """Without either MCP_JWT_SIGNING_KEY or OIDC_CLIENT_SECRET the
+    Fernet key cannot be derived.
+    """
     monkeypatch.setenv("MCP_OAUTH_STORAGE_URL", "redis://valkey:6379/11")
     monkeypatch.delenv("OIDC_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("MCP_JWT_SIGNING_KEY", raising=False)
 
-    with pytest.raises(ValueError, match="OIDC_CLIENT_SECRET is unset"):
+    with pytest.raises(
+        ValueError,
+        match="neither MCP_JWT_SIGNING_KEY nor OIDC_CLIENT_SECRET is set",
+    ):
         build_oauth_storage()
 
 
-def test_builds_fernet_wrapped_valkey_store(monkeypatch):
-    """Set env → returns FernetEncryptionWrapper around a ValkeyStore.
+def test_builds_fernet_wrapped_valkey_store_from_client_secret(monkeypatch):
+    """Confidential-client path: only OIDC_CLIENT_SECRET set.
 
     Skips when the Valkey GLIDE client isn't installed (uv install without
     the [valkey] extra). This branch is exercised in CI / dev images.
@@ -107,8 +114,50 @@ def test_builds_fernet_wrapped_valkey_store(monkeypatch):
 
     monkeypatch.setenv("MCP_OAUTH_STORAGE_URL", "redis://valkey:6379/11")
     monkeypatch.setenv("OIDC_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.delenv("MCP_JWT_SIGNING_KEY", raising=False)
 
     store = build_oauth_storage()
 
     assert isinstance(store, FernetEncryptionWrapper)
     assert isinstance(store.key_value, valkey_store_cls)
+
+
+def test_builds_fernet_wrapped_valkey_store_from_jwt_signing_key(monkeypatch):
+    """Public-client path: only MCP_JWT_SIGNING_KEY set."""
+    pytest.importorskip("glide")
+    valkey_module = importlib.import_module("key_value.aio.stores.valkey")
+    valkey_store_cls = valkey_module.ValkeyStore
+
+    monkeypatch.setenv("MCP_OAUTH_STORAGE_URL", "redis://valkey:6379/11")
+    monkeypatch.delenv("OIDC_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "test-signing-key")
+
+    store = build_oauth_storage()
+
+    assert isinstance(store, FernetEncryptionWrapper)
+    assert isinstance(store.key_value, valkey_store_cls)
+
+
+def test_client_secret_takes_precedence_over_jwt_signing_key(monkeypatch):
+    """When both are set, OIDC_CLIENT_SECRET wins (confidential Cognito client
+    is the typical prod setup; the signing key is the sandbox/public fallback).
+    Spy on derive_jwt_key to record the material fed into HKDF.
+    """
+    pytest.importorskip("glide")
+
+    monkeypatch.setenv("MCP_OAUTH_STORAGE_URL", "redis://valkey:6379/11")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "preferred-client-secret")
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "should-be-ignored")
+
+    real_derive = storage_module.derive_jwt_key
+    captured: list[str] = []
+
+    def spy(*, high_entropy_material: str, salt: str) -> bytes:
+        captured.append(high_entropy_material)
+        return real_derive(high_entropy_material=high_entropy_material, salt=salt)
+
+    monkeypatch.setattr(storage_module, "derive_jwt_key", spy)
+
+    build_oauth_storage()
+
+    assert captured == ["preferred-client-secret"]

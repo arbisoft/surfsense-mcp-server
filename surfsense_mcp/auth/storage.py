@@ -11,10 +11,11 @@ encrypted file tree inside the container, which means
 - horizontal scaling is impossible (state is per-container).
 
 Setting ``MCP_OAUTH_STORAGE_URL`` swaps the file store for a Valkey/Redis
-backend, Fernet-wrapped with a key derived from ``OIDC_CLIENT_SECRET`` so
-the on-disk RDB never holds plaintext tokens. Unset → fall through to
-FastMCP's default file store (back-compat for users running the image
-outside the devstack).
+backend, Fernet-wrapped with a key derived from ``OIDC_CLIENT_SECRET``
+(confidential clients — preferred when present) or ``MCP_JWT_SIGNING_KEY``
+(public/PKCE clients) so the on-disk RDB never holds plaintext tokens.
+Unset → fall through to FastMCP's default file store (back-compat for
+users running the image outside the devstack).
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ logger = get_logger(__name__)
 
 # Same salt FastMCP uses for the file-store encryption key
 # (fastmcp/server/auth/oauth_proxy/proxy.py:458). Sharing the salt means
-# rotating OIDC_CLIENT_SECRET invalidates state in either backend
+# rotating the chosen entropy source invalidates state in either backend
 # consistently — no surprise where one store keeps decrypting while the
 # other doesn't.
 _STORAGE_KEY_SALT = "fastmcp-storage-encryption-key"
@@ -90,9 +91,9 @@ def build_oauth_storage() -> AsyncKeyValue | None:
     ``redis://`` or ``valkey://`` URL, returns a :class:`ValkeyStore`
     wrapped in :class:`FernetEncryptionWrapper`.
 
-    Raises ``ValueError`` when the URL is malformed or
-    ``OIDC_CLIENT_SECRET`` is missing (without it the Fernet key cannot
-    be derived deterministically).
+    Raises ``ValueError`` when the URL is malformed or neither
+    ``MCP_JWT_SIGNING_KEY`` nor ``OIDC_CLIENT_SECRET`` is set (without
+    one of them the Fernet key cannot be derived deterministically).
     """
     raw = os.getenv("MCP_OAUTH_STORAGE_URL", "").strip()
     if not raw:
@@ -100,15 +101,19 @@ def build_oauth_storage() -> AsyncKeyValue | None:
 
     config = parse_storage_url(raw)
 
-    client_secret = os.getenv("OIDC_CLIENT_SECRET", "").strip()
-    if not client_secret:
+    # Prefer the upstream client secret when present (confidential Cognito
+    # client — the typical prod setup). Fall back to MCP_JWT_SIGNING_KEY
+    # for public/PKCE clients (sandbox / no-secret deployments).
+    key_material = os.getenv("OIDC_CLIENT_SECRET", "").strip() or os.getenv("MCP_JWT_SIGNING_KEY", "").strip()
+    if not key_material:
         raise ValueError(
-            "MCP_OAUTH_STORAGE_URL is set but OIDC_CLIENT_SECRET is unset; "
-            "the Fernet encryption key cannot be derived without it."
+            "MCP_OAUTH_STORAGE_URL is set but neither MCP_JWT_SIGNING_KEY "
+            "nor OIDC_CLIENT_SECRET is set; the Fernet encryption key "
+            "cannot be derived without one of them."
         )
 
     # Imported lazily so unit tests for ``parse_storage_url`` and the
-    # ``OIDC_CLIENT_SECRET`` guard don't require the Valkey GLIDE client.
+    # missing-key-material guard don't require the Valkey GLIDE client.
     from key_value.aio.stores.valkey import ValkeyStore
 
     valkey_store = ValkeyStore(
@@ -119,7 +124,7 @@ def build_oauth_storage() -> AsyncKeyValue | None:
         password=config.password,
     )
     encryption_key = derive_jwt_key(
-        high_entropy_material=client_secret,
+        high_entropy_material=key_material,
         salt=_STORAGE_KEY_SALT,
     )
     logger.info(

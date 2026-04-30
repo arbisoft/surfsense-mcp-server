@@ -65,6 +65,7 @@ python -m surfsense_mcp stdio
 # Run HTTP mode (multi-user, auto-OAuth via AWSCognitoProvider)
 # In the devstack this points at the internal backend DNS; locally
 # running outside docker can target a public SurfSense URL.
+# Confidential Cognito client (has a secret):
 SURFSENSE_BASE_URL=http://surfsense-backend:8000 \
 MCP_BASE_URL=https://foss-research-mcp.local.moneta.dev \
 COGNITO_USER_POOL_ID=ap-southeast-1_XXXXX \
@@ -72,6 +73,15 @@ COGNITO_AWS_REGION=ap-southeast-1 \
 OIDC_CLIENT_ID=...        \
 OIDC_CLIENT_SECRET=...    \
 python -m surfsense_mcp http   # binds :8211
+
+# Public/PKCE Cognito client (no secret) — supply MCP_JWT_SIGNING_KEY instead:
+SURFSENSE_BASE_URL=http://surfsense-backend:8000 \
+MCP_BASE_URL=https://foss-research-mcp.local.moneta.dev \
+COGNITO_USER_POOL_ID=ap-southeast-1_XXXXX \
+COGNITO_AWS_REGION=ap-southeast-1 \
+OIDC_CLIENT_ID=...                          \
+MCP_JWT_SIGNING_KEY=$(openssl rand -hex 32) \
+python -m surfsense_mcp http
 ```
 
 In the Moneta devstack everything except `OIDC_CLIENT_ID/SECRET` and
@@ -84,7 +94,7 @@ client's allowed callback URLs (no new client required).
 ### Transport modes
 
 - **stdio** — single-user, per-developer install (Claude Desktop / Cursor / VS Code on a laptop). `SURFSENSE_JWT` env var carries the token; password fallback (`SURFSENSE_EMAIL` + `SURFSENSE_PASSWORD`) is available for CI / long-running sessions. `get_stdio_mcp()` builds a FastMCP instance without an auth provider; the JWT is read directly in `client.py` and sent as `Authorization: Bearer`.
-- **http** — multi-user, hosted. `get_header_mcp()` attaches FastMCP's `AWSCognitoProvider`, which makes the service itself a full OAuth 2.0 authorization server: it publishes `/.well-known/oauth-authorization-server` + `/.well-known/oauth-protected-resource` (RFC 8414 / 9728), implements the `/register` DCR shim over the pre-registered Cognito app client (RFC 7591), and proxies `/authorize` / `/auth/callback` / `/token` to Cognito. MCP clients (Claude Desktop / Cursor) discover all of this and run the OAuth flow automatically — no manual Bearer paste. Port: `8211`. This service is **not** behind mPass; FastMCP is the sole auth layer. The MCP → SurfSense call goes direct on the docker network (`http://surfsense-backend:8000`) with the MCP server injecting `X-Auth-Request-User` from the validated token's `username` claim; SurfSense's `ProxyAuthMiddleware` synthesizes the email and auto-provisions the user.
+- **http** — multi-user, hosted. `get_header_mcp()` attaches FastMCP's `AWSCognitoProvider`, which makes the service itself a full OAuth 2.0 authorization server: it publishes `/.well-known/oauth-authorization-server` + `/.well-known/oauth-protected-resource` (RFC 8414 / 9728), implements the `/register` DCR shim over the pre-registered Cognito app client (RFC 7591), and proxies `/authorize` / `/auth/callback` / `/token` to Cognito. MCP clients (Claude Desktop / Cursor) discover all of this and run the OAuth flow automatically — no manual Bearer paste. Port: `8211`. This service is **not** behind mPass; FastMCP is the sole auth layer. The MCP → SurfSense call goes direct on the docker network (`http://surfsense-backend:8000`) with the MCP server injecting `X-Auth-Request-User` from the validated token's `username` claim; SurfSense's `ProxyAuthMiddleware` synthesizes the email and auto-provisions the user. Public Cognito clients (no `client_secret`) are supported by setting `MCP_JWT_SIGNING_KEY` instead — the server passes `client_secret=""` and the explicit signing key to `AWSCognitoProvider`. authlib's `AsyncOAuth2Client` handles the empty-secret token exchange correctly without any further override.
 
 ### Auth model
 
@@ -118,7 +128,7 @@ No manual Bearer paste and no Cognito client config needed on the MCP client sid
 `AWSCognitoProvider` (via `OAuthProxy`) keeps six collections of OAuth state — DCR client registrations, in-flight authorize transactions, authorization codes, upstream Cognito access/refresh tokens, JTI mappings, and refresh-token metadata. Two backends:
 
 - **Default — encrypted file tree** under `~/.local/share/fastmcp/oauth-proxy/<fingerprint>/` inside the container. Survives `docker compose restart`, but `docker compose down && up` recreates the container's writable layer and wipes everything → every MCP client re-OAuths on next call. Single-replica only.
-- **Production — Valkey/Redis** (`MCP_OAUTH_STORAGE_URL=redis://valkey:6379/<db>`). `auth/storage.py:build_oauth_storage()` parses the URL, constructs a `ValkeyStore`, and wraps it in `FernetEncryptionWrapper` keyed off `OIDC_CLIENT_SECRET` (same HKDF derivation FastMCP uses for the file store, so on-disk RDB never carries plaintext). State survives container recreation; multi-replica works as long as all replicas point at the same instance.
+- **Production — Valkey/Redis** (`MCP_OAUTH_STORAGE_URL=redis://valkey:6379/<db>`). `auth/storage.py:build_oauth_storage()` parses the URL, constructs a `ValkeyStore`, and wraps it in `FernetEncryptionWrapper` keyed off `OIDC_CLIENT_SECRET` (preferred — confidential clients) or `MCP_JWT_SIGNING_KEY` (fallback — public/PKCE clients). The same HKDF derivation FastMCP uses for the file store, so on-disk RDB never carries plaintext. State survives container recreation; multi-replica works as long as all replicas point at the same instance.
 
 In the Moneta devstack the compose file always sets `MCP_OAUTH_STORAGE_URL=redis://valkey:6379/11` so the backend is Valkey by default. `__main__.py:warn_if_storage_missing_in_production()` logs a warning when `MCP_ENV=production` and the URL is unset; we don't hard-fail because evaluation/local runs of the image should still come up.
 

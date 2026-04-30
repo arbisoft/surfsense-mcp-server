@@ -56,11 +56,13 @@ This is the more interesting layer. FastMCP's [`AWSCognitoProvider`](https://gof
 
 1. **Discovery** — the server publishes `/.well-known/oauth-authorization-server` (RFC 8414) and `/.well-known/oauth-protected-resource` (RFC 9728). MCP clients hit `/mcp`, get a `401 WWW-Authenticate: Bearer resource_metadata=…` challenge, and fetch the metadata.
 2. **DCR shim** — Cognito has no native [Dynamic Client Registration](https://datatracker.ietf.org/doc/html/rfc7591). The server's `/register` endpoint accepts MCP-client registrations and returns the *single, pre-registered* Cognito app client to all of them. So Claude Desktop, Cursor, MCP Inspector — every client looks like its own OAuth client to itself, but they all share the underlying Cognito client.
-3. **Authorization code flow with PKCE** — the server proxies `/authorize` → Cognito's hosted UI, captures the code at `/auth/callback`, exchanges it server-side at Cognito's `/oauth2/token` (with the confidential client secret), and returns the Cognito access token to the MCP client.
+3. **Authorization code flow with PKCE** — the server proxies `/authorize` → Cognito's hosted UI, captures the code at `/auth/callback`, exchanges it server-side at Cognito's `/oauth2/token` (with the confidential client secret, or PKCE-only when the Cognito client is public — `client_secret=""` is passed through and authlib handles the exchange without a Basic header), and returns the Cognito access token to the MCP client.
 4. **Bearer validation** — every `/mcp/*` request is Bearer-validated against the Cognito user pool's JWKS (no live calls to Cognito on the hot path).
 5. **Backend identity injection** — tools read the validated token's `username` claim and forward it as `X-Auth-Request-User` to the SurfSense backend on the internal docker network. SurfSense's `ProxyAuthMiddleware` reads the header, synthesizes `{username}@{SMB_NAME}.com` if no email is set, and auto-provisions/loads the user. **The Cognito Bearer is never forwarded** — identity on the MCP → backend leg is header-based, exactly like how oauth2-proxy injects identity for the web apps.
 
 This means the MCP server is the only Moneta service that does *not* sit behind mPass (oauth2-proxy ForwardAuth) — MCP clients can't follow interactive OIDC redirects mid-stream, so we let FastMCP handle the full OAuth dance instead. The MCP → SurfSense leg also bypasses mPass: it goes direct on the docker network, with the trust boundary being the network itself (no host port published).
+
+**Confidential vs. public Cognito clients.** Both work. If the Cognito app client has a secret, set `OIDC_CLIENT_SECRET` and FastMCP derives everything else from it. If the client is public (PKCE, no secret), leave `OIDC_CLIENT_SECRET` unset and provide `MCP_JWT_SIGNING_KEY` instead — that key signs FastMCP-issued JWTs and seeds the Fernet wrapper around the OAuth-state store. Generate it once with `openssl rand -hex 32` and treat it like any other long-lived signing secret (rotating it invalidates all persisted OAuth state, so every MCP client will re-OAuth on next call).
 
 **One-time AWS Console prereq.** On the existing Cognito app client (`OIDC_CLIENT_ID`), add `${MCP_BASE_URL}/auth/callback` to the allowed callback URLs. No new Cognito client, no new secret.
 
@@ -130,6 +132,7 @@ The server calls `POST /auth/jwt/login`, caches the token for `TOKEN_TTL` second
 In the Moneta devstack the MCP server runs as a docker-compose service and everything is auto-wired by `make dev.up.surfsense`. To run it standalone:
 
 ```bash
+# Confidential Cognito client (has a secret)
 SURFSENSE_BASE_URL=http://localhost:8000 \
 MCP_BASE_URL=https://my-mcp.example.com \
 COGNITO_USER_POOL_ID=ap-southeast-1_XXXXXXXXX \
@@ -137,9 +140,18 @@ COGNITO_AWS_REGION=ap-southeast-1 \
 OIDC_CLIENT_ID=<cognito-app-client-id> \
 OIDC_CLIENT_SECRET=<cognito-app-client-secret> \
 python -m surfsense_mcp http   # binds 0.0.0.0:8211
+
+# Public/PKCE Cognito client (no secret)
+SURFSENSE_BASE_URL=http://localhost:8000 \
+MCP_BASE_URL=https://my-mcp.example.com \
+COGNITO_USER_POOL_ID=ap-southeast-1_XXXXXXXXX \
+COGNITO_AWS_REGION=ap-southeast-1 \
+OIDC_CLIENT_ID=<cognito-public-client-id> \
+MCP_JWT_SIGNING_KEY=$(openssl rand -hex 32) \
+python -m surfsense_mcp http
 ```
 
-The server validates these on startup (see `surfsense_mcp/__main__.py:REQUIRED_HTTP_ENV_VARS`) and refuses to start if any are missing.
+The server validates the four base env vars on startup (see `surfsense_mcp/__main__.py:REQUIRED_HTTP_ENV_VARS`) and additionally requires exactly one of `OIDC_CLIENT_SECRET` (confidential) or `MCP_JWT_SIGNING_KEY` (public). It refuses to start otherwise.
 
 ## MCP client config
 
@@ -228,9 +240,11 @@ The fastest way to verify a fresh deploy. Inspector is `npx`-installed, runs loc
 | `TOKEN_TTL` | optional | stdio | Cache lifetime for password-fallback tokens (seconds, min 60, default 3300). |
 | `MCP_BASE_URL` | yes | http | Public URL where this MCP server is reachable, e.g. `https://foss-research-mcp.local.moneta.dev`. Used to build the OAuth callback URL. |
 | `COGNITO_USER_POOL_ID` / `COGNITO_AWS_REGION` | yes | http | Cognito pool to validate Bearer tokens against. |
-| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | yes | http | Cognito app client used for the OAuth proxy. Reuses the existing oauth2-proxy client in the Moneta devstack. |
+| `OIDC_CLIENT_ID` | yes | http | Cognito app client used for the OAuth proxy. Reuses the existing oauth2-proxy client in the Moneta devstack. |
+| `OIDC_CLIENT_SECRET` | conditional | http | Set when the Cognito client is confidential. Leave unset for public/PKCE clients (then `MCP_JWT_SIGNING_KEY` is required). Exactly one of the two must be set. |
+| `MCP_JWT_SIGNING_KEY` | conditional | http | Required when the Cognito client is public (no secret). High-entropy string used both to sign FastMCP-issued JWTs and to derive the Fernet key for `MCP_OAUTH_STORAGE_URL`. Generate with `openssl rand -hex 32`. Rotating it invalidates persisted OAuth state. |
 | `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | optional | http | Comma-separated allow-list for DCR-registered redirect URIs. Empty/unset → localhost-only defaults (covers Claude Desktop, Cursor, MCP Inspector). Add server-side MCP clients explicitly. |
-| `MCP_OAUTH_STORAGE_URL` | optional | http | Valkey/Redis URL for OAuth state (`redis://valkey:6379/11`). Unset → encrypted file store on the container filesystem; tokens are wiped on container recreation and there's no path to multi-replica. Set this in any deployment that needs to survive `docker compose down && up` or scale beyond one replica. State at rest is Fernet-encrypted using a key derived from `OIDC_CLIENT_SECRET`. |
+| `MCP_OAUTH_STORAGE_URL` | optional | http | Valkey/Redis URL for OAuth state (`redis://valkey:6379/11`). Unset → encrypted file store on the container filesystem; tokens are wiped on container recreation and there's no path to multi-replica. Set this in any deployment that needs to survive `docker compose down && up` or scale beyond one replica. State at rest is Fernet-encrypted using a key derived from `OIDC_CLIENT_SECRET` (preferred — confidential clients) or `MCP_JWT_SIGNING_KEY` (fallback — public/PKCE clients). |
 | `MCP_ENV` | optional | http | `production` triggers warnings when `MCP_ALLOWED_ORIGINS` is unset/`*` or `MCP_OAUTH_STORAGE_URL` is unset. Default `development`. |
 | `MCP_ALLOWED_ORIGINS` | optional | http | Comma-separated CORS origins. Default `*`. |
 | `MCP_LOG_LEVEL` | optional | both | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` (case-insensitive). Unset → derived from `MCP_ENV`: `production` → `INFO`, anything else → `DEBUG`. Bogus values warn at startup and fall through to the env-derived default. |

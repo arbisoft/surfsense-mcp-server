@@ -104,6 +104,7 @@ def test_get_header_mcp_wires_aws_cognito_provider(monkeypatch):
     monkeypatch.setenv("COGNITO_AWS_REGION", "ap-southeast-1")
     monkeypatch.setenv("OIDC_CLIENT_ID", "test-client-id")
     monkeypatch.setenv("OIDC_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.delenv("MCP_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setenv("MCP_BASE_URL", "https://mcp.test.example.com")
     monkeypatch.delenv("MCP_ALLOWED_CLIENT_REDIRECT_URIS", raising=False)
 
@@ -141,7 +142,9 @@ def test_get_header_mcp_forwards_client_storage(monkeypatch):
 
     Without forwarding, the provider keeps its default file store and refresh
     tokens vanish on container recreation. We patch the constructor and assert
-    on the kwarg rather than wiring up real Valkey here.
+    on the kwarg rather than wiring up real Valkey here. Also verifies the
+    confidential-client wiring: client_secret comes through and
+    jwt_signing_key stays None so FastMCP derives it from the secret.
     """
     from fastmcp.server.auth.providers import aws as aws_module
 
@@ -152,6 +155,7 @@ def test_get_header_mcp_forwards_client_storage(monkeypatch):
     monkeypatch.setenv("COGNITO_AWS_REGION", "ap-southeast-1")
     monkeypatch.setenv("OIDC_CLIENT_ID", "test-client-id")
     monkeypatch.setenv("OIDC_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.delenv("MCP_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setenv("MCP_BASE_URL", "https://mcp.test.example.com")
 
     sentinel = object()
@@ -170,6 +174,55 @@ def test_get_header_mcp_forwards_client_storage(monkeypatch):
         server_module.get_header_mcp()
 
     assert captured.get("client_storage") is sentinel
+    assert captured.get("client_secret") == "test-client-secret"
+    assert captured.get("jwt_signing_key") is None
+
+
+def test_get_header_mcp_supports_public_cognito_client(monkeypatch):
+    """Public/PKCE Cognito clients have no secret.
+
+    The server passes ``client_secret=""`` and forwards
+    ``MCP_JWT_SIGNING_KEY`` as ``jwt_signing_key``. authlib's
+    ``AsyncOAuth2Client`` handles the empty-secret case correctly without
+    any token-endpoint-auth-method override — verified end-to-end against
+    a real public Cognito client.
+    """
+    import httpx as httpx_module
+    from fastmcp.server.auth.providers.aws import AWSCognitoProvider
+
+    from surfsense_mcp import server as server_module
+    from surfsense_mcp.auth import storage as storage_module
+
+    monkeypatch.setenv("COGNITO_USER_POOL_ID", "ap-southeast-1_TEST123")
+    monkeypatch.setenv("COGNITO_AWS_REGION", "ap-southeast-1")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "test-public-client-id")
+    monkeypatch.delenv("OIDC_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "test-signing-key-with-32-bytes-of-entropy")
+    monkeypatch.setenv("MCP_BASE_URL", "https://mcp.test.example.com")
+    monkeypatch.delenv("MCP_ALLOWED_CLIENT_REDIRECT_URIS", raising=False)
+
+    monkeypatch.setattr(storage_module, "build_oauth_storage", lambda: None)
+
+    pool_url = "https://cognito-idp.ap-southeast-1.amazonaws.com/ap-southeast-1_TEST123"
+    discovery_doc = {
+        "issuer": pool_url,
+        "authorization_endpoint": f"{pool_url}/oauth2/authorize",
+        "token_endpoint": f"{pool_url}/oauth2/token",
+        "jwks_uri": f"{pool_url}/.well-known/jwks.json",
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+    }
+
+    def _stub_discovery(url, **kwargs):
+        return httpx_module.Response(200, json=discovery_doc, request=httpx_module.Request("GET", url))
+
+    monkeypatch.setattr(httpx_module, "get", _stub_discovery)
+
+    mcp = server_module.get_header_mcp()
+
+    assert isinstance(mcp.auth, AWSCognitoProvider)
+    assert mcp.auth.client_id == "test-public-client-id"
 
 
 async def test_http_request_raises_when_username_missing(monkeypatch):

@@ -74,11 +74,14 @@ def get_header_mcp() -> FastMCP:
 
     from surfsense_mcp.auth.storage import build_oauth_storage
 
+    client_secret = os.getenv("OIDC_CLIENT_SECRET", "")
+    jwt_signing_key = os.getenv("MCP_JWT_SIGNING_KEY") or None
+
     provider = AWSCognitoProvider(
         user_pool_id=os.environ["COGNITO_USER_POOL_ID"],
         aws_region=os.environ["COGNITO_AWS_REGION"],
         client_id=os.environ["OIDC_CLIENT_ID"],
-        client_secret=os.environ["OIDC_CLIENT_SECRET"],
+        client_secret=client_secret,
         base_url=os.environ["MCP_BASE_URL"],
         redirect_path="/auth/callback",
         required_scopes=["openid"],
@@ -91,7 +94,12 @@ def get_header_mcp() -> FastMCP:
         forward_resource=False,
         # None → FastMCP keeps its encrypted-file default. See auth/storage.py.
         client_storage=build_oauth_storage(),
+        # For confidential clients FastMCP derives the JWT signing key from
+        # client_secret automatically. Public clients have no secret, so the
+        # entropy must come from MCP_JWT_SIGNING_KEY instead.
+        jwt_signing_key=jwt_signing_key,
     )
+
     mcp = FastMCP(
         "SurfSense MCP Server (http)",
         icons=[ICON],

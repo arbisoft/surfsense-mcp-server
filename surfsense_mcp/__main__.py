@@ -22,7 +22,6 @@ REQUIRED_HTTP_ENV_VARS = (
     "COGNITO_USER_POOL_ID",
     "COGNITO_AWS_REGION",
     "OIDC_CLIENT_ID",
-    "OIDC_CLIENT_SECRET",
 )
 
 DEFAULT_HTTP_PORT = 8211
@@ -218,6 +217,15 @@ def main() -> None:
         missing = [name for name in REQUIRED_HTTP_ENV_VARS if not os.getenv(name)]
         if missing:
             raise ValueError("http mode is missing required env vars: " + ", ".join(missing))
+        # AWSCognitoProvider needs entropy for FastMCP-issued JWTs. Confidential
+        # Cognito clients supply OIDC_CLIENT_SECRET (FastMCP derives the signing
+        # key from it). Public/PKCE clients have no secret and must supply
+        # MCP_JWT_SIGNING_KEY explicitly. One of the two must be set.
+        if not os.getenv("OIDC_CLIENT_SECRET") and not os.getenv("MCP_JWT_SIGNING_KEY"):
+            raise ValueError(
+                "http mode requires OIDC_CLIENT_SECRET (confidential client) "
+                "or MCP_JWT_SIGNING_KEY (public/PKCE client)."
+            )
         warn_if_storage_missing_in_production()
         header_mcp = get_header_mcp()
         cors = [
