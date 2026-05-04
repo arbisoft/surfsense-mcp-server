@@ -1,16 +1,20 @@
 """Per-request auth headers for SurfSense backend calls.
 
-Two transports, two strategies:
+Two transports, three strategies (the HTTP transport branches on URL scheme):
 
 - **stdio** (single-user, on a developer's laptop) → ``Authorization: Bearer
   <surfsense-jwt>`` from ``SURFSENSE_JWT`` or the password fallback.
-- **http** (multi-user, behind FastMCP's ``AWSCognitoProvider``) →
+- **http + HTTPS base URL** (call traverses Traefik + mPass) →
+  ``Authorization: Bearer <cognito-jwt>``; oauth2-proxy validates the JWT
+  against the Cognito JWKS and sets ``X-Auth-Request-User`` itself.
+- **http + HTTP base URL** (direct docker-network call, no Traefik) →
   ``X-Auth-Request-User`` derived from the validated Cognito token's
   ``username`` claim. The Cognito Bearer is *not* forwarded.
 
 The dispatcher in :func:`build_auth_headers` picks based on whether a FastMCP
-HTTP request scope is active. See :mod:`surfsense_mcp.auth.stdio` and
-:mod:`surfsense_mcp.auth.http` for the per-mode internals.
+HTTP request scope is active; the per-mode internals live in
+:mod:`surfsense_mcp.auth.stdio` and :mod:`surfsense_mcp.auth.http` (the latter
+also owns the HTTPS-vs-HTTP scheme branch).
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ async def build_auth_headers() -> dict[str, str]:
     """Return the auth header(s) to attach to the next SurfSense backend call."""
     token = _http.request_token()
     if token is not None:
-        return _http.username_header(token)
+        return _http.auth_headers_for_token(token)
     return {"Authorization": f"Bearer {await _stdio.resolve_jwt()}"}
 
 

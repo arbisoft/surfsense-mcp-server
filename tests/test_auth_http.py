@@ -82,3 +82,56 @@ def test_username_header_raises_when_claims_dict_empty() -> None:
     token = _make_token({})
     with pytest.raises(RuntimeError, match="username claim missing"):
         http_auth.username_header(token)
+
+
+def test_bearer_header_returns_authorization_bearer_pair() -> None:
+    """``bearer_header`` forwards the raw JWT untouched — that is the same
+    string oauth2-proxy will validate against the Cognito JWKS."""
+    token = _make_token({"sub": "abc-1234", "username": "alice"})
+    assert http_auth.bearer_header(token) == {
+        "Authorization": "Bearer cognito-access-token-zzz"
+    }
+
+
+def test_bearer_header_raises_when_raw_token_empty() -> None:
+    """An ``AccessToken`` with no raw JWT means we have nothing to forward to
+    oauth2-proxy — fail loudly rather than send a malformed Authorization header."""
+    from fastmcp.server.auth.auth import AccessToken
+
+    token = AccessToken(
+        token="",
+        client_id="mcp-client",
+        scopes=["openid"],
+        expires_at=int(time.time() + 3600),
+        claims={"username": "alice"},
+    )
+    with pytest.raises(RuntimeError, match="no raw token string"):
+        http_auth.bearer_header(token)
+
+
+def test_auth_headers_for_token_picks_bearer_for_https(monkeypatch) -> None:
+    """HTTPS base URL → request will traverse Traefik + mPass; identity must
+    ride ``Authorization`` because Traefik strips ``X-Auth-Request-*``."""
+    monkeypatch.setenv("SURFSENSE_BASE_URL", "https://foss-research.local.moneta.dev")
+    token = _make_token({"sub": "abc-1234", "username": "alice"})
+    headers = http_auth.auth_headers_for_token(token)
+    assert headers == {"Authorization": "Bearer cognito-access-token-zzz"}
+
+
+def test_auth_headers_for_token_picks_username_for_http(monkeypatch) -> None:
+    """HTTP base URL → direct docker-network call, no Traefik in the path; we
+    inject the identity header ourselves and skip the (irrelevant) Bearer."""
+    monkeypatch.setenv("SURFSENSE_BASE_URL", "http://surfsense-backend:8000")
+    token = _make_token({"sub": "abc-1234", "username": "alice"})
+    headers = http_auth.auth_headers_for_token(token)
+    assert headers == {"X-Auth-Request-User": "alice"}
+
+
+def test_auth_headers_for_token_defaults_to_username_when_unset(monkeypatch) -> None:
+    """No URL configured at all → fall through to ``username_header``. The
+    base-URL validator in ``client._base_url`` will fail the call later — at
+    this layer we just want predictable behavior, not surprise bearers."""
+    monkeypatch.delenv("SURFSENSE_BASE_URL", raising=False)
+    token = _make_token({"sub": "abc-1234", "username": "alice"})
+    headers = http_auth.auth_headers_for_token(token)
+    assert headers == {"X-Auth-Request-User": "alice"}

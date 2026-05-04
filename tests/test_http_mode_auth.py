@@ -52,7 +52,7 @@ def _install_mock_transport(monkeypatch, handler) -> None:
 
 
 async def test_http_request_injects_x_auth_request_user(monkeypatch, cognito_access_token):
-    """The username claim flows to SurfSense via X-Auth-Request-User, with no Bearer."""
+    """HTTP base URL → direct docker-network path: X-Auth-Request-User, no Bearer."""
     monkeypatch.setenv("SURFSENSE_BASE_URL", "http://surfsense-backend:8000")
     monkeypatch.delenv("SURFSENSE_JWT", raising=False)
     # Tempt the password fallback path — HTTP mode must not touch it.
@@ -81,6 +81,42 @@ async def test_http_request_injects_x_auth_request_user(monkeypatch, cognito_acc
     assert req.headers["x-auth-request-user"] == "alice"
     # The Cognito Bearer is NOT forwarded — SurfSense auth is header-based here.
     assert "authorization" not in {k.lower() for k in req.headers}
+
+
+async def test_https_request_forwards_cognito_bearer(monkeypatch, cognito_access_token):
+    """HTTPS base URL → Traefik+mPass path: Bearer flows through, no X-Auth header.
+
+    The MCP server must not pre-inject ``X-Auth-Request-User`` here because
+    Traefik's ``strip-auth-headers`` middleware would clear it before mPass
+    runs. oauth2-proxy validates the Bearer against the same Cognito JWKS
+    FastMCP already used and sets the identity header itself.
+    """
+    monkeypatch.setenv("SURFSENSE_BASE_URL", "https://foss-research.local.moneta.dev")
+    monkeypatch.delenv("SURFSENSE_JWT", raising=False)
+
+    recorded: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded.append(request)
+        return httpx.Response(200, json=[{"id": 1, "name": "default"}])
+
+    _install_mock_transport(monkeypatch, handler)
+
+    reset = _set_request_token(cognito_access_token)
+    try:
+        response = await client_module.authed_request("GET", "/api/v1/searchspaces")
+    finally:
+        _reset_request_token(reset)
+
+    assert response.status_code == 200
+    assert len(recorded) == 1
+    req = recorded[0]
+    assert req.url.path == "/api/v1/searchspaces"
+    # The raw Cognito JWT rides as a standard Bearer for oauth2-proxy to validate.
+    assert req.headers["authorization"] == "Bearer cognito-access-token-zzz"
+    # We must NOT pre-inject the identity header — strip-auth-headers would
+    # clear it anyway, but a stale value would mask Bearer validation bugs.
+    assert "x-auth-request-user" not in {k.lower() for k in req.headers}
 
 
 def test_get_header_mcp_wires_aws_cognito_provider(monkeypatch):

@@ -66,7 +66,14 @@ async def _login_with_password() -> str:
         raise RuntimeError("Password-login fallback requires SURFSENSE_EMAIL and SURFSENSE_PASSWORD.")
 
     url = f"{_base_url()}/auth/jwt/login"
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT_SECONDS) as client:
+    # Lazy import — ``surfsense_mcp.client`` imports ``surfsense_mcp.auth``
+    # (this package) at module load, so this would otherwise be a cycle.
+    from surfsense_mcp.client import _ssl_verify
+
+    async with httpx.AsyncClient(
+        timeout=_DEFAULT_TIMEOUT_SECONDS,
+        verify=_ssl_verify(),
+    ) as client:
         response = await client.post(
             url,
             data={"username": email, "password": password},

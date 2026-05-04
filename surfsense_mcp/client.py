@@ -11,6 +11,7 @@ per-mode credential resolution lives in :mod:`surfsense_mcp.auth` (see
 from __future__ import annotations
 
 import os
+import ssl
 from typing import IO, NamedTuple
 
 import httpx
@@ -37,6 +38,23 @@ def _base_url() -> str:
     return base_url
 
 
+def _ssl_verify() -> ssl.SSLContext | bool:
+    """Return ``verify=`` for httpx, optionally extending the system trust store.
+
+    When ``SURFSENSE_BASE_URL`` is HTTPS against a host with a private CA
+    (e.g. Traefik's mkcert leaf at ``foss-research.local.moneta.dev``), point
+    ``SURFSENSE_CA_BUNDLE_PATH`` at the PEM cert/bundle and we'll layer it on
+    top of the default OpenSSL trust store so calls to public CAs (Cognito's
+    JWKS, etc.) keep working.
+    """
+    extra = os.getenv("SURFSENSE_CA_BUNDLE_PATH", "").strip()
+    if not extra:
+        return True
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(cafile=extra)
+    return ctx
+
+
 async def get_surfsense_client_context() -> SurfSenseClientContext:
     """Return an httpx client configured with base URL + per-mode auth headers.
 
@@ -50,6 +68,7 @@ async def get_surfsense_client_context() -> SurfSenseClientContext:
         base_url=base_url,
         headers={**auth_headers, "Content-Type": "application/json"},
         timeout=DEFAULT_TIMEOUT_SECONDS,
+        verify=_ssl_verify(),
     )
     return SurfSenseClientContext(client=client, base_url=base_url)
 
@@ -113,6 +132,7 @@ async def authed_multipart_post(
             base_url=_base_url(),
             timeout=request_timeout,
             headers=auth_headers,
+            verify=_ssl_verify(),
         ) as client:
             return await client.post(path, files=files, data=data)
 
@@ -172,6 +192,7 @@ class _StreamContext:
             base_url=_base_url(),
             timeout=httpx.Timeout(DEFAULT_TIMEOUT_SECONDS, read=None),
             headers={**auth_headers, **self._extra_headers},
+            verify=_ssl_verify(),
         )
         request = self._client.build_request(
             self._method, self._path, json=self._json, params=self._params

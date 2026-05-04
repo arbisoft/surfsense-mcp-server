@@ -66,9 +66,15 @@ def get_header_mcp() -> FastMCP:
     any manual Bearer paste.
 
     The same Cognito access token the client obtains is then Bearer-validated
-    via Cognito's JWKS on every request to ``/mcp``; tools read the validated
-    token's claims via ``get_access_token()`` and inject ``X-Auth-Request-User``
-    when calling the SurfSense backend on the internal docker network.
+    via Cognito's JWKS on every request to ``/mcp``; how that identity reaches
+    the SurfSense backend depends on ``SURFSENSE_BASE_URL`` (see
+    :mod:`surfsense_mcp.auth.http`):
+
+    * HTTPS base URL → forward the validated Cognito Bearer untouched and let
+      oauth2-proxy / mPass validate it (against the same JWKS) and set
+      ``X-Auth-Request-User`` itself.
+    * HTTP base URL → call SurfSense direct on the docker network and inject
+      ``X-Auth-Request-User`` from the validated token's ``username`` claim.
     """
     from fastmcp.server.auth.providers.aws import AWSCognitoProvider
 
