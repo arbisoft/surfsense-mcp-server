@@ -1,0 +1,58 @@
+[project]
+name = "surfsense-mcp-server"
+version = "0.1.0"
+description = "A Model Context Protocol server for SurfSense integration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Hunzlah Malik", email = "50262751+hunzlahmalik@users.noreply.github.com" },
+]
+keywords = ["mcp", "surfsense", "fastmcp", "ai", "research"]
+
+dependencies = [
+    "fastmcp>=3.2.0,<4.0.0",
+    "mcp>=1.26.0",
+    "httpx>=0.27.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.30.0",
+    # Adds the Valkey GLIDE backend so HTTP-mode OAuth state can be stored
+    # outside the container filesystem (see surfsense_mcp/auth/storage.py).
+    # Pin matches FastMCP's transitive py-key-value-aio constraint.
+    "py-key-value-aio[valkey]>=0.4.4,<0.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+surfsense-mcp-server = "surfsense_mcp.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["surfsense_mcp*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
